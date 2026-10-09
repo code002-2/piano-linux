@@ -1,0 +1,121 @@
+#!/bin/sh
+# piano-display-test — basic display / panel bring-up evidence.
+#
+# Usage: piano-display-test [--bars] [--noise] [--hold SECONDS]
+#
+# 1. Reports the DRM/fbcon state (what probed, what mode is active).
+# 2. --bars paints full-screen solid colour fields through /dev/fb0
+#    (red, green, blue, white, black); --noise paints random data.
+# 3. Leaves a black screen and prints a dmesg summary.
+#
+# The fbcon text console itself is the primary "display alive" evidence;
+# this script exercises the full pixel path beyond the text console.
+# Colour bytes are composed NUL-safely by growing small files by doubling.
+
+BARS=0
+NOISE=0
+HOLD=2
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --bars)  BARS=1; shift ;;
+        --noise) NOISE=1; shift ;;
+        --hold)  HOLD=${2-}; shift 2 ;;
+        -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
+        *) echo "piano-display-test: unknown option: $1" >&2; exit 2 ;;
+    esac
+done
+
+case "$HOLD" in ''|*[!0-9]*) echo "piano-display-test: --hold needs a number" >&2; exit 2 ;; esac
+
+TMP=$(mktemp -d /tmp/piano-disp.XXXXXX)
+trap 'rm -rf "$TMP"' EXIT
+
+echo "== DRM state =="
+for c in /sys/class/drm/card*; do
+    [ -e "$c" ] || continue
+    for e in "$c"-*; do
+        [ -d "$e" ] || continue
+        printf '  %-24s status=%s enabled=%s\n' "${e##*/}" \
+            "$(cat "$e/status" 2>/dev/null)" "$(cat "$e/enabled" 2>/dev/null)"
+    done
+done
+
+echo
+echo "== framebuffer =="
+FB=/dev/fb0
+if [ ! -c "$FB" ]; then
+    echo "piano-display-test: no $FB — fbdev missing (dmesg below)"
+    dmesg 2>/dev/null | grep -iE 'mdss|dsi|panel|msmdrm|drm' | tail -25
+    exit 1
+fi
+W=$(cut -d, -f1 /sys/class/graphics/fb0/virtual_size 2>/dev/null)
+H=$(cut -d, -f2 /sys/class/graphics/fb0/virtual_size 2>/dev/null)
+BPP=$(cat /sys/class/graphics/fb0/bits_per_pixel 2>/dev/null)
+echo "$FB: ${W:-?}x${H:-?} ${BPP:-?}bpp"
+
+for bl in /sys/class/backlight/*; do
+    [ -d "$bl" ] || continue
+    echo "backlight: $(basename "$bl") brightness=$(cat "$bl/brightness") max=$(cat "$bl/max_brightness")"
+done
+
+grow() { # grow FILE to at least SIZE bytes by doubling it
+    f=$1; want=$2
+    while [ "$(wc -c < "$f")" -lt "$want" ]; do
+        cat "$f" "$f" > "$f.double" || return 1
+        mv "$f.double" "$f"
+    done
+    return 0
+}
+
+fill_screen() { # fill_screen R G B  (0-255 each, 32bpp RGBX little-endian)
+    r=$1; g=$2; b=$3
+    # The format string is the payload (busybox \xNN escapes).
+    # shellcheck disable=SC2059
+    printf "\\x$(printf '%02x' "$r")\\x$(printf '%02x' "$g")\\x$(printf '%02x' "$b")\\xff" > "$TMP/pix"
+    row_bytes=$((W * BPP / 8))
+    total_bytes=$((W * H * BPP / 8))
+    cp "$TMP/pix" "$TMP/row" || return 1
+    grow "$TMP/row" "$row_bytes" || return 1
+    head -c "$row_bytes" "$TMP/row" > "$TMP/row.trim" || return 1
+    mv "$TMP/row.trim" "$TMP/row"
+    cp "$TMP/row" "$TMP/screen" || return 1
+    grow "$TMP/screen" "$total_bytes" || return 1
+    head -c "$total_bytes" "$TMP/screen" > "$FB" 2>/dev/null
+}
+
+set_backlight() { # set_backlight PERCENT
+    for bl in /sys/class/backlight/*; do
+        [ -d "$bl" ] || continue
+        max=$(cat "$bl/max_brightness" 2>/dev/null || echo 0)
+        [ "$max" -gt 0 ] 2>/dev/null || continue
+        echo $((max * $1 / 100)) > "$bl/brightness" 2>/dev/null || true
+    done
+}
+
+if [ "$BARS" = 1 ] || [ "$NOISE" = 1 ]; then
+    if [ -z "$W" ] || [ "$W" -le 0 ] 2>/dev/null || [ -z "$H" ] || [ "$H" -le 0 ] 2>/dev/null; then
+        echo "piano-display-test: unknown fb geometry" >&2
+        exit 2
+    fi
+    set_backlight 50
+    if [ "$BARS" = 1 ]; then
+        echo "painting solid fields, ${HOLD}s each (R G B W K): watch the panel"
+        fill_screen 255 0   0;   sleep "$HOLD"
+        fill_screen 0   255 0;   sleep "$HOLD"
+        fill_screen 0   0   255; sleep "$HOLD"
+        fill_screen 255 255 255; sleep "$HOLD"
+        fill_screen 0   0   0;   sleep "$HOLD"
+    fi
+    if [ "$NOISE" = 1 ]; then
+        echo "painting random noise (${HOLD}s) — every channel must flicker"
+        head -c $((W * H * BPP / 8)) /dev/urandom > "$FB" 2>/dev/null
+        sleep "$HOLD"
+    fi
+    fill_screen 0 0 0   # leave a clean black screen
+    set_backlight 30
+fi
+
+echo
+echo "== dmesg (display-related) =="
+dmesg 2>/dev/null | grep -iE 'mdss|dsi|panel|nt37801|backlight|drm' | tail -25

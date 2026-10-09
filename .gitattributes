@@ -1,0 +1,83 @@
+# =============================================================
+# linux-xiaomi-piano umbrella repository .gitattributes
+# Goals: uniform LF endings, correct per-type diffs, binary safety
+# =============================================================
+
+# Global: normalize text files to LF
+* text=auto eol=lf
+
+# ---- C / kernel sources ----
+*.c    text diff=cpp
+*.h    text diff=cpp
+*.S    text diff=cpp
+*.rs   text diff=rust
+*.ld   text
+
+# ---- Device tree ----
+*.dts   text diff=dts
+*.dtsi  text diff=dts
+*.dtso  text diff=dts
+*.dtb   binary
+*.dtbo  binary
+
+# ---- Build system ----
+Makefile    text
+Makefile*   text
+*.mk        text
+Kconfig     text
+Kconfig*    text
+*.bzl       text
+BUILD       text
+
+# ---- Scripts / packaging ----
+*.sh        text
+*.bash      text
+*.service   text
+*.rules     text
+*.desktop   text
+*.mount     text
+*.target    text
+*.timer     text
+
+# ---- Docs / data ----
+*.md        text
+*.txt       text
+*.json      text
+*.yaml      text
+*.yml       text
+*.toml      text
+*.conf      text
+*.config    text
+*defconfig  text
+
+# ---- Patch files ----
+*.patch     text
+*.diff      text
+
+# ---- Images: text vector vs binary raster ----
+*.svg       text
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.webp      binary
+*.ico       binary
+*.pdf       binary
+
+# ---- Firmware/binaries (second safety net alongside .gitignore: immune to EOL damage even if force-added) ----
+*.mbn  binary
+*.elf  binary
+*.fw   binary
+*.bin  binary
+*.img  binary
+*.ko   binary
+*.so   binary
+*.a    binary
+*.dll  binary
+*.exe  binary
+
+# ---- GitHub linguist (language stats & code browsing) ----
+*.dts   linguist-language=C
+*.dtsi  linguist-language=C
+*.dtso  linguist-language=C
+*.mk    linguist-language=Makefile

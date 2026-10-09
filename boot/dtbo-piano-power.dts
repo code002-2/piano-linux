@@ -1,0 +1,118 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* Power profile: sleep statistics, CPU thermal shutdown, CPU bandwidth
+ * monitors.  Builds on the camera profile; the image dtbo of the same
+ * revision uses this profile.
+ *
+ *   - The stock ram@c3f0000 node only carries the downstream
+ *     "qcom,rpmh-stats-v4" compatible, which the mainline qcom_stats
+ *     driver does not know, so there has been no visibility into the
+ *     low-power residencies at all.  The fragment appends the mainline
+ *     "qcom,rpmh-stats" compatible: same register window (0xc3f0000,
+ *     0x400 — the sm8550-class layout the driver expects: soc sleep
+ *     stats at +0x48, DDR stats at +0xb8, subsystem stats in SMEM), and
+ *     the stock qcom,qmp phandle for the DDR sync is left untouched (the
+ *     mainline aoss-qmp driver is bound to that node).  After
+ *     `modprobe qcom_stats` (loaded through modules-load.d) the counters
+ *     appear in /sys/kernel/debug/qcom_stats/.
+ *   - The stock CPU thermal zones (cpu-0-*, cpu-1-*) only carry passive
+ *     (95/105/120/135 degC) and hot (125 degC) trips; there is no
+ *     critical trip, so the kernel never shuts the board down in an
+ *     orderly fashion when the cooling devices lose the race — only the
+ *     CPUCP/LMh hardware limit remains.  Each zone gains a 125 degC
+ *     critical trip, at the stock hot level.
+ *   - The stock bwmon4 nodes at 0x240b3400/0x240b7400 have no mainline
+ *     driver; the CPU bandwidth monitors are re-stated next to them in
+ *     the upstream sm8750.dtsi shape (one 0x600 window, the shared GIC
+ *     581 interrupt, an APPS->EBI1 vote through gem_noc/mc_virt and the
+ *     upstream OPP table).  With QCOM_ICC_BWMON=m and icc-bwmon loaded
+ *
+ *     through modules-load.d, the monitors vote for CPU memory
+ *     bandwidth themselves; today the providers still sit at their
+ *     initial INT_MAX votes, so the monitors change nothing yet — they
+ *     are the precondition for ever letting the DDR/LLCC votes drop.
+ */
+#include "dtbo-piano-camera.dts"
+#include <dt-bindings/interconnect/qcom,icc.h>
+#include <dt-bindings/interconnect/qcom,sm8750-rpmh.h>
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+
+/ {
+	fragment@350 {
+		target-path = "/soc/ram@c3f0000";
+		__overlay__ {
+			compatible = "qcom,rpmh-stats-v4", "qcom,rpmh-stats";
+		};
+	};
+
+	/* Emergency shutdown at the stock hot level, for every CPU zone.
+	 * Without a critical trip the kernel only throttles; the orderly
+	 * poweroff at 125 degC complements the CPUCP/LMh hardware limit.
+	 */
+	fragment@351 {
+		target-path = "/soc/thermal-zones";
+		__overlay__ {
+			cpu-0-0-0 { trips { cpu-critical { temperature = <125000>; hysteresis = <0>; type = "critical"; }; }; };
+			cpu-0-0-1 { trips { cpu-critical { temperature = <125000>; hysteresis = <0>; type = "critical"; }; }; };
+			cpu-0-1-0 { trips { cpu-critical { temperature = <125000>; hysteresis = <0>; type = "critical"; }; }; };
+			cpu-0-1-1 { trips { cpu-critical { temperature = <125000>; hysteresis = <0>; type = "critical"; }; }; };
+			cpu-0-2-0 { trips { cpu-critical { temperature = <125000>; hysteresis = <0>; type = "critical"; }; }; };
+			cpu-0-2-1 { trips { cpu-critical { temperature = <125000>; hysteresis = <0>; type = "critical"; }; }; };
+			cpu-0-3-0 { trips { cpu-critical { temperature = <125000>; hysteresis = <0>; type = "critical"; }; }; };
+			cpu-0-3-1 { trips { cpu-critical { temperature = <125000>; hysteresis = <0>; type = "critical"; }; }; };
+			cpu-0-4-0 { trips { cpu-critical { temperature = <125000>; hysteresis = <0>; type = "critical"; }; }; };
+			cpu-0-4-1 { trips { cpu-critical { temperature = <125000>; hysteresis = <0>; type = "critical"; }; }; };
+			cpu-0-5-0 { trips { cpu-critical { temperature = <125000>; hysteresis = <0>; type = "critical"; }; }; };
+			cpu-0-5-1 { trips { cpu-critical { temperature = <125000>; hysteresis = <0>; type = "critical"; }; }; };
+			cpu-1-0-0 { trips { cpu-critical { temperature = <125000>; hysteresis = <0>; type = "critical"; }; }; };
+			cpu-1-0-1 { trips { cpu-critical { temperature = <125000>; hysteresis = <0>; type = "critical"; }; }; };
+			cpu-1-1-0 { trips { cpu-critical { temperature = <125000>; hysteresis = <0>; type = "critical"; }; }; };
+			cpu-1-1-1 { trips { cpu-critical { temperature = <125000>; hysteresis = <0>; type = "critical"; }; }; };
+		};
+	};
+
+	/* CPU bandwidth monitors, in the upstream sm8750.dtsi shape, next to
+	 * the driverless stock bwmon4 nodes.  They vote on the APPS->EBI1
+	 * path themselves, the precondition for letting the DDR/LLCC
+	 * aggregate votes drop later.
+	 */
+	fragment@352 {
+		target-path = "/soc";
+		__overlay__ {
+			bwmon_cpu0_ml: bwmon-cpu-ml@240b3400 {
+				compatible = "qcom,sm8750-cpu-bwmon", "qcom,sdm845-bwmon";
+				reg = <0x240b3400 0x600>;
+				interrupts = <GIC_SPI 581 IRQ_TYPE_LEVEL_HIGH>;
+				interconnects = <&gem_noc MASTER_APPSS_PROC QCOM_ICC_TAG_ACTIVE_ONLY>,
+						<&mc_virt SLAVE_EBI1 QCOM_ICC_TAG_ACTIVE_ONLY>;
+				operating-points-v2 = <&cpu_bwmon_opp_table_ml>;
+				nonposted-mmio;
+
+				cpu_bwmon_opp_table_ml: opp-table {
+					compatible = "operating-points-v2";
+
+					opp-0 { opp-peak-kBps = <800000>; };
+					opp-1 { opp-peak-kBps = <2188000>; };
+					opp-2 { opp-peak-kBps = <5414400>; };
+					opp-3 { opp-peak-kBps = <6220800>; };
+					opp-4 { opp-peak-kBps = <6835200>; };
+					opp-5 { opp-peak-kBps = <8371200>; };
+					opp-6 { opp-peak-kBps = <10944000>; };
+					opp-7 { opp-peak-kBps = <12748800>; };
+					opp-8 { opp-peak-kBps = <14745600>; };
+					opp-9 { opp-peak-kBps = <16896000>; };
+					opp-10 { opp-peak-kBps = <19046400>; };
+				};
+			};
+
+			bwmon_cpu1_ml: bwmon-cpu-ml@240b7400 {
+				compatible = "qcom,sm8750-cpu-bwmon", "qcom,sdm845-bwmon";
+				reg = <0x240b7400 0x600>;
+				interrupts = <GIC_SPI 581 IRQ_TYPE_LEVEL_HIGH>;
+				interconnects = <&gem_noc MASTER_APPSS_PROC QCOM_ICC_TAG_ACTIVE_ONLY>,
+						<&mc_virt SLAVE_EBI1 QCOM_ICC_TAG_ACTIVE_ONLY>;
+				operating-points-v2 = <&cpu_bwmon_opp_table_ml>;
+				nonposted-mmio;
+			};
+		};
+	};
+};

@@ -1,0 +1,133 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* Userdata storage on top of the device-verified display/USB/touch/radio overlay.
+ * Register/clock layout: upstream sm8750.dtsi; board wiring: stock piano DT.
+ * Rails are inherited from ABL, as in the existing PCIe bring-up profile.
+ * UFS PHY stays modular: /pianoinit repairs SID 0x60 before it can start DMA.
+ * Also names the board for userspace: the stock base DT calls it
+ * "Qualcomm Technologies, Inc. Piano based on SM8750".
+ */
+#include "dtbo-piano-wlanbt.dts"
+/ {
+	fragment@250 {
+		target-path = "/soc";
+		__overlay__ {
+			#address-cells = <1>;
+			#size-cells = <1>;
+			ufs_rails_ml: ufs-rails-ml {
+				compatible = "regulator-fixed";
+				regulator-name = "ufs-bootloader-rails";
+				regulator-always-on;
+				regulator-boot-on;
+			};
+			/* Like PCIe, avoid the legacy wrongly-addressed TCSR provider.
+			 * /pianoinit enables the real UFS bit before loading the PHY.
+			 */
+			ufs_clkref_ml: ufs-clkref-ml {
+				compatible = "fixed-clock";
+				clock-frequency = <19200000>;
+				#clock-cells = <0>;
+			};
+		};
+	};
+	fragment@251 {
+		target-path = "/soc/ufsphy_mem@1d80000";
+		__overlay__ {
+			compatible = "qcom,sm8750-qmp-ufs-phy";
+			clocks = <&rpmhcc_ml RPMH_CXO_CLK>,
+				 <&gcc GCC_UFS_PHY_PHY_AUX_CLK>,
+				 <&ufs_clkref_ml>;
+			clock-names = "ref", "ref_aux", "qref";
+			resets = <&ufshc_mem 0>;
+			reset-names = "ufsphy";
+			power-domains = <&gcc GCC_UFS_MEM_PHY_GDSC>;
+			vdda-phy-supply = <&ufs_rails_ml>;
+			vdda-pll-supply = <&ufs_rails_ml>;
+			vdd-phy-gdsc-supply;
+			vdda-qref-supply;
+			vdda-refgen-supply;
+			#clock-cells = <1>;
+			#phy-cells = <0>;
+			status = "okay";
+		};
+	};
+	fragment@252 {
+		target-path = "/soc/ufshc@1d84000";
+		__overlay__ {
+			compatible = "qcom,sm8750-ufshc", "qcom,ufshc", "jedec,ufs-2.0";
+			reg = <0x01d84000 0x3000>;
+			reg-names = "ufs_mem";
+			clocks = <&gcc GCC_UFS_PHY_AXI_CLK>,
+				 <&gcc GCC_AGGRE_UFS_PHY_AXI_CLK>,
+				 <&gcc GCC_UFS_PHY_AHB_CLK>,
+				 <&gcc GCC_UFS_PHY_UNIPRO_CORE_CLK>,
+				 <&rpmhcc_ml RPMH_LN_BB_CLK3>,
+				 <&gcc GCC_UFS_PHY_TX_SYMBOL_0_CLK>,
+				 <&gcc GCC_UFS_PHY_RX_SYMBOL_0_CLK>,
+				 <&gcc GCC_UFS_PHY_RX_SYMBOL_1_CLK>;
+			clock-names = "core_clk", "bus_aggr_clk", "iface_clk",
+				      "core_clk_unipro", "ref_clk", "tx_lane0_sync_clk",
+				      "rx_lane0_sync_clk", "rx_lane1_sync_clk";
+			freq-table-hz = <100000000 403000000 0 0 0 0 100000000 403000000
+					 0 0 0 0 0 0 0 0>;
+			resets = <&gcc GCC_UFS_PHY_BCR>;
+			reset-names = "rst";
+			reset-gpios;
+			interconnects = <&aggre1_noc MASTER_UFS_MEM QCOM_ICC_TAG_ALWAYS
+					 &mc_virt SLAVE_EBI1 QCOM_ICC_TAG_ALWAYS>,
+					<&gem_noc MASTER_APPSS_PROC QCOM_ICC_TAG_ACTIVE_ONLY
+					 &config_noc SLAVE_UFS_MEM_CFG QCOM_ICC_TAG_ACTIVE_ONLY>;
+			interconnect-names = "ufs-ddr", "cpu-ufs";
+			power-domains = <&gcc GCC_UFS_PHY_GDSC>;
+			vdd-hba-supply;
+			vcc-supply = <&ufs_rails_ml>;
+			vccq-supply = <&ufs_rails_ml>;
+			qcom,vccq-proxy-vote-supply;
+			qcom,vddp-ref-clk-supply;
+			qcom,vccq-parent-supply;
+			iommus;
+			depends-on-supply;
+			memory-region;
+			msi-parent;
+			shared-ice-cfg;
+			phys = <&ufsphy_mem>;
+			phy-names = "ufsphy";
+			status = "okay";
+		};
+	};
+	/* Volume-up gpio-keys: re-state the stock node's references here.
+	 * ABL shifts the phandle references inside the stock-derived
+	 * fragments twice (target nodes +delta, references +2*delta), so the
+	 * stock gpio_keys pinctrl-0/gpios point at nothing and gpio-keys fails
+	 * with "invalid phandle".  References written from these fragments
+	 * are shifted once, like the node phandles; later fragments override
+	 * the stock properties.
+	 */
+	fragment@253 {
+		target = <&soc>;
+		__overlay__ {
+			gpio_keys {
+				pinctrl-0 = <&key_vol_up_default>;
+				vol_up {
+					gpios = <&pm8550_gpios 6 GPIO_ACTIVE_LOW>;
+				};
+			};
+		};
+	};
+	/* Read by hostnamed (GNOME "About") and benchmarks as the model */
+	fragment@254 {
+		target-path = "/";
+		__overlay__ {
+			model = "Xiaomi Pad 8 Pro";
+		};
+	};
+	/* ABL scans out XRGB: a8b8g8r8 swapped red/blue (blue Tux). Same-name
+	 * fragment merges into the inherited framebuffer node at dtc time.
+	 */
+	fragment@200 {
+		__overlay__ {
+			framebuffer@fc800000 {
+				format = "a8r8g8b8";
+			};
+		};
+	};
+};

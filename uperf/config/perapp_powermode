@@ -1,0 +1,33 @@
+# Uperf-Linux per-application power mode mapping
+# Format: <process_pattern> <mode>   (space or colon separated)
+# Patterns are matched against /proc/[pid]/comm and /proc/[pid]/cmdline
+# Modes: balance, powersave, performance, fast
+
+# Genshin Impact / Honkai: Star Rail (miHoYo/HoYoverse)
+cn.hoyoverse                    performance
+com.miHoYo                      performance
+
+# PUBG Mobile
+com.tencent.tmgp.pubgmhd        performance
+com.pubg                        performance
+
+# Call of Duty Mobile
+com.activision.callofduty.shift performance
+
+# Minecraft
+Minecraft                       balance
+com.mojang                      balance
+
+# Emulators
+retroarch                       balance
+dolphin                         balance
+ppsspp                          balance
+yuzu                            balance
+
+# Steam games (via Proton)
+steam                           balance
+proton                          balance
+wine                            balance
+
+# Default
+.*                              balance

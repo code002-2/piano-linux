@@ -1,0 +1,10 @@
+[Unit]
+Description=Swap file on userdata
+After=local-fs.target
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/piano/swapfile-start
+ExecStop=-/usr/sbin/swapoff /swapfile
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target

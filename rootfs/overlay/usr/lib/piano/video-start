@@ -1,0 +1,45 @@
+#!/bin/sh
+# video-start: Iris video codec bring-up (piano-video service).
+#
+# Runs after piano-display, which loads the apps SMMU driver the codec is
+# attached to. The kernel runs with iommu.passthrough=1 (see the display
+# overlay), but Iris needs a translated DMA domain: its DMA mask
+# (0xdfffffff) is below what the direct mapping accepts, so it fails to
+# probe with -EIO in an identity domain. Its IOMMU group holds only the
+# codec and is switched to DMA before the driver binds.
+#
+# The firmware (qcom/sm8750/xiaomi/piano/vpu35_4v.mbn) boots on the first
+# open of /dev/video*, not here.
+# /etc/piano/video.conf may set VIDEO_START=0 to skip everything.
+set -eu
+
+VIDEO_START=1
+# shellcheck source=/dev/null
+[ ! -r /etc/piano/video.conf ] || . /etc/piano/video.conf
+
+CODEC=/sys/bus/platform/devices/aa00000.video-codec-ml
+
+say() {
+    echo "piano-video: $*"
+    echo "piano-video: $*" > /dev/kmsg 2>/dev/null || true
+}
+
+die() {
+    say "FAIL: $*"
+    exit 1
+}
+
+[ "$VIDEO_START" = 1 ] || { say "disabled by /etc/piano/video.conf"; exit 0; }
+
+[ -e "$CODEC/iommu_group" ] || die 'codec has no IOMMU group (apps SMMU not bound?)'
+echo DMA > "$CODEC/iommu_group/type" || die 'cannot switch the codec IOMMU group to DMA'
+
+modprobe videocc_sm8750
+modprobe qcom_iris
+
+n=0
+until [ -e "$CODEC/driver" ]; do
+    [ "$n" -lt 100 ] || die 'Iris not bound'
+    sleep 0.1; n=$((n + 1))
+done
+say "DONE $(cat /sys/class/video4linux/video*/name 2>/dev/null | tr '\n' ' ')"

@@ -1,0 +1,604 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* Camera profile: the camera subsystem and both image sensors.
+ *
+ * Register layout, clocks and bindings follow upstream sm8750.dtsi and the
+ * SM8750 CAMSS binding, converted to the 1-cell /soc bus of the stock base.
+ * Every node is added next to its stock downstream counterpart
+ * (qcom,sun-camcc, qcom,cci, qcom,cam-cpas, ...), which stays driverless.
+ *
+ *   - CAMSS runs the RDI path (CSIPHY -> CSID -> TFE write master): the
+ *     sensors deliver raw Bayer frames and libcamera's software ISP does
+ *     the image processing.  The TFE pixel path (CSID IPP -> TFE IQ
+ *     pipeline -> NV12) also runs, with fixed settings; its IQ modules
+ *     need the TFE Bayer clocks listed below, without which a register
+ *     access hangs the camera NoC and resets the SoC.  The rest of the
+ *     stock CamX ISP (OFE, IPE, ICP firmware) has no mainline driver.
+ *   - Rear: Samsung S5KJN1 (stock module piano_qtech_s5kjn1sq03_wide_i)
+ *     on CCI0 master 1 (gpio115/116), CSIPHY1, 4 lanes; MCLK1 (gpio90),
+ *     reset gpio6.  The upstream driver needs a 24 MHz MCLK (stock runs
+ *     19.2 MHz with its own register settings).
+ *   - Front: OmniVision OV32D40 (stock piano_ofilm_ov32d40_front_i) on a
+ *     plain QUP I2C bus, QUP2 SE1 (stock qupv3_se9_i2c, gpio4/5), at 0x10,
+ *     CSIPHY4, 4 lanes; MCLK4 (gpio93, cam_aon_mclk4), reset gpio7.  The
+ *     ADSP also knows this sensor (always-on camera, qsh_camera_aon), but
+ *     nothing on Linux starts that use case.
+ *   - Supplies, from the stock sensor nodes (piano-sm8750-camera-sensor):
+ *     rear vana = gpio175 switch (2.8 V), vio = L6B 1.8 V, vdig = L1I,
+ *     vaf = L7B 2.8 V; front vana = gpio176 switch, vio = L10B 1.8 V,
+ *     vdig = L2G 1.2 V.  These LDOs feed nothing else in the stock tree.
+ *     L1I is 1.1 V on stock; the mainline LDO step rounds that up to
+ *     1.104 V, and a vote above the stock window can reset the SoC (L14B,
+ *     keyboard profile), so it asks for 1.096 V, the step below.
+ *   - The CSIPHY rails are L1F (0.88 V) and L3G (1.2 V), shared with the
+ *     DSI and USB PHYs: CAMSS only gets an always-on stand-in.
+ *   - CAMSS uses the stock IFE stream 0x1c00 through the mainline apps
+ *     SMMU node.  No interconnect paths: the multimedia NoC provider is not
+ *     bound, the bootloader's votes kept alive by the display carry the
+ *     camera traffic as well (as for the video codec).
+ *   - The MCLK branches of cambistmclkcc only run while the camcc Titan
+ *     top GDSC is on ("stuck at off" otherwise), so both sensors hold that
+ *     power domain.
+ *   - Rear focus: GT9764BA VCM at 0x0c on the same CCI bus (stock actuator
+ *     piano_qtech_s5kjn1sq03_wide_i), register-compatible with the GT9769
+ *     handled by dw9768: vin = L6B, vdd = L7B, as stock.
+ *   - Mounting: the rear module is upside down relative to the panel's
+ *     natural orientation (rotation 180), the front one is upright.
+ *   - The stock sensor and EEPROM children of the front I2C bus are
+ *     disabled, so the I2C core does not claim 0x10 for them.
+ *
+ * Nothing loads the drivers on coldplug: the piano-camera service does,
+ * after the display chain.
+ */
+#include "dtbo-piano-cpufreq.dts"
+#include <dt-bindings/clock/qcom,sm8750-cambistmclkcc.h>
+#include <dt-bindings/clock/qcom,sm8750-camcc.h>
+#include <dt-bindings/clock/qcom,sm8750-gcc.h>
+#include <dt-bindings/dma/qcom-gpi.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interconnect/qcom,icc.h>
+#include <dt-bindings/interconnect/qcom,sm8750-rpmh.h>
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+#include <dt-bindings/power/qcom,rpmhpd.h>
+#include <dt-bindings/regulator/qcom,rpmh-regulator.h>
+
+/ {
+	/* sensor LDOs, as separate mainline blocks (see header) */
+	fragment@340 {
+		target = <&apps_rsc>;
+		__overlay__ {
+			cam_regs_b: regulators-5 {
+				compatible = "qcom,pm8550-rpmh-regulators";
+				qcom,pmic-id = "b";
+
+				vreg_l6b_1p8_ml: ldo6 {
+					regulator-name = "vreg_l6b_1p8_ml";
+					regulator-min-microvolt = <1800000>;
+					regulator-max-microvolt = <1800000>;
+					regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+				};
+
+				vreg_l7b_2p8_ml: ldo7 {
+					regulator-name = "vreg_l7b_2p8_ml";
+					regulator-min-microvolt = <2800000>;
+					regulator-max-microvolt = <2800000>;
+					regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+				};
+
+				vreg_l10b_1p8_ml: ldo10 {
+					regulator-name = "vreg_l10b_1p8_ml";
+					regulator-min-microvolt = <1800000>;
+					regulator-max-microvolt = <1800000>;
+					regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+				};
+			};
+
+			cam_regs_g: regulators-6 {
+				compatible = "qcom,pm8550ve-rpmh-regulators";
+				qcom,pmic-id = "g";
+
+				vreg_l2g_1p2_ml: ldo2 {
+					regulator-name = "vreg_l2g_1p2_ml";
+					regulator-min-microvolt = <1200000>;
+					regulator-max-microvolt = <1200000>;
+					regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+				};
+			};
+
+			cam_regs_i: regulators-7 {
+				compatible = "qcom,pm8550ve-rpmh-regulators";
+				qcom,pmic-id = "i";
+
+				vreg_l1i_1p1_ml: ldo1 {
+					regulator-name = "vreg_l1i_1p1_ml";
+					/* never 1104 mV: see above */
+					regulator-min-microvolt = <1096000>;
+					regulator-max-microvolt = <1096000>;
+					regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+				};
+			};
+		};
+	};
+
+	fragment@341 {
+		target-path = "/";
+		__overlay__ {
+			/* stand-in for L1F/L3G, see header */
+			cam_csiphy_rails_ml: cam-csiphy-rails-ml {
+				compatible = "regulator-fixed";
+				regulator-name = "cam_csiphy_rails_ml";
+				regulator-always-on;
+				regulator-boot-on;
+			};
+
+			cam_wide_avdd_ml: cam-wide-avdd-ml {
+				compatible = "regulator-fixed";
+				regulator-name = "cam_wide_avdd_ml";
+				regulator-min-microvolt = <2800000>;
+				regulator-max-microvolt = <2800000>;
+				gpio = <&piano_tlmm_ml 175 GPIO_ACTIVE_HIGH>;
+				enable-active-high;
+				startup-delay-us = <100>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&cam_wide_avdd_ml_pins>;
+			};
+
+			cam_front_avdd_ml: cam-front-avdd-ml {
+				compatible = "regulator-fixed";
+				regulator-name = "cam_front_avdd_ml";
+				regulator-min-microvolt = <2800000>;
+				regulator-max-microvolt = <2800000>;
+				gpio = <&piano_tlmm_ml 176 GPIO_ACTIVE_HIGH>;
+				enable-active-high;
+				startup-delay-us = <100>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&cam_front_avdd_ml_pins>;
+			};
+		};
+	};
+
+	/* pins as in the stock camera states */
+	fragment@342 {
+		target-path = "/soc";
+		__overlay__ {
+			pinctrl@f100000 {
+				cam_cci0_1_ml: cam-cci0-1-state {
+					sda-pins {
+						pins = "gpio115";
+						function = "cci_i2c_sda";
+						drive-strength = <4>;
+						bias-disable;
+					};
+
+					scl-pins {
+						pins = "gpio116";
+						function = "cci_i2c_scl";
+						drive-strength = <4>;
+						bias-disable;
+					};
+				};
+
+				cam_wide_ml: cam-wide-state {
+					mclk-pins {
+						pins = "gpio90";
+						function = "cam_mclk";
+						drive-strength = <4>;
+						bias-disable;
+					};
+
+					reset-pins {
+						pins = "gpio6";
+						function = "gpio";
+						drive-strength = <2>;
+						bias-disable;
+					};
+				};
+
+				cam_front_ml: cam-front-state {
+					mclk-pins {
+						pins = "gpio93";
+						function = "cam_aon_mclk4";
+						drive-strength = <2>;
+						bias-disable;
+					};
+
+					reset-pins {
+						pins = "gpio7";
+						function = "gpio";
+						drive-strength = <2>;
+						bias-disable;
+					};
+				};
+
+				cam_wide_avdd_ml_pins: cam-wide-avdd-state {
+					pins = "gpio175";
+					function = "gpio";
+					drive-strength = <2>;
+					bias-disable;
+				};
+
+				cam_front_avdd_ml_pins: cam-front-avdd-state {
+					pins = "gpio176";
+					function = "gpio";
+					drive-strength = <2>;
+					bias-disable;
+				};
+
+				cam_i2c9_ml: cam-i2c9-state {
+					pins = "gpio4", "gpio5";
+					function = "qup2_se1";
+					drive-strength = <2>;
+					bias-disable;
+				};
+			};
+		};
+	};
+
+	fragment@343 {
+		target-path = "/soc";
+		__overlay__ {
+			cambistmclkcc_ml: clock-controller-ml@1760000 {
+				compatible = "qcom,sm8750-cambistmclkcc";
+				reg = <0x1760000 0x6000>;
+				clocks = <&gcc GCC_CAM_BIST_MCLK_AHB_CLK>,
+					 <&bi_tcxo_div2>,
+					 <&bi_tcxo_ao_div2>,
+					 <&sleep_clk>;
+				power-domains = <&rpmhpd_ml RPMHPD_MMCX>,
+						<&rpmhpd_ml RPMHPD_MX>;
+				required-opps = <&rpmhpd_opp_low_svs_ml>,
+						<&rpmhpd_opp_low_svs_ml>;
+				#clock-cells = <1>;
+				#reset-cells = <1>;
+				#power-domain-cells = <1>;
+			};
+
+			camcc_ml: clock-controller-ml@ade0000 {
+				compatible = "qcom,sm8750-camcc";
+				reg = <0xade0000 0x20000>;
+				clocks = <&gcc GCC_CAMERA_AHB_CLK>,
+					 <&bi_tcxo_div2>,
+					 <&bi_tcxo_ao_div2>,
+					 <&sleep_clk>;
+				power-domains = <&rpmhpd_ml RPMHPD_MMCX>,
+						<&rpmhpd_ml RPMHPD_MXC>;
+				required-opps = <&rpmhpd_opp_low_svs_ml>,
+						<&rpmhpd_opp_low_svs_ml>;
+				#clock-cells = <1>;
+				#reset-cells = <1>;
+				#power-domain-cells = <1>;
+			};
+
+			cci0_ml: cci-ml@ac7b000 {
+				compatible = "qcom,sm8750-cci", "qcom,msm8996-cci";
+				reg = <0xac7b000 0x1000>;
+				interrupts = <GIC_SPI 426 IRQ_TYPE_EDGE_RISING>;
+				power-domains = <&camcc_ml CAM_CC_TITAN_TOP_GDSC>;
+				clocks = <&camcc_ml CAM_CC_CAM_TOP_AHB_CLK>,
+					 <&camcc_ml CAM_CC_CCI_0_CLK>;
+				clock-names = "ahb", "cci";
+				/* the only rate of the stock and mainline tables */
+				assigned-clocks = <&camcc_ml CAM_CC_CCI_0_CLK>;
+				assigned-clock-rates = <37500000>;
+				pinctrl-names = "default", "sleep";
+				pinctrl-0 = <&cam_cci0_1_ml>;
+				pinctrl-1 = <&cam_cci0_1_ml>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				cci0_i2c1_ml: i2c-bus@1 {
+					reg = <1>;
+					clock-frequency = <1000000>;
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					cam_wide_vcm_ml: vcm@c {
+						compatible = "giantec,gt9769";
+						reg = <0x0c>;
+						vin-supply = <&vreg_l6b_1p8_ml>;
+						vdd-supply = <&vreg_l7b_2p8_ml>;
+					};
+
+					camera@10 {
+						compatible = "samsung,s5kjn1";
+						reg = <0x10>;
+						power-domains = <&camcc_ml CAM_CC_TITAN_TOP_GDSC>;
+						clocks = <&cambistmclkcc_ml CAM_BIST_MCLK_CC_MCLK1_CLK>;
+						assigned-clocks = <&cambistmclkcc_ml CAM_BIST_MCLK_CC_MCLK1_CLK>;
+						assigned-clock-rates = <24000000>;
+						reset-gpios = <&piano_tlmm_ml 6 GPIO_ACTIVE_LOW>;
+						pinctrl-names = "default";
+						pinctrl-0 = <&cam_wide_ml>;
+						afvdd-supply = <&vreg_l7b_2p8_ml>;
+						vdda-supply = <&cam_wide_avdd_ml>;
+						vddd-supply = <&vreg_l1i_1p1_ml>;
+						vddio-supply = <&vreg_l6b_1p8_ml>;
+						orientation = <1>;
+						rotation = <180>;
+						lens-focus = <&cam_wide_vcm_ml>;
+
+						port {
+							cam_wide_ep_ml: endpoint {
+								data-lanes = <1 2 3 4>;
+								link-frequencies = /bits/ 64 <700000000>;
+								remote-endpoint = <&csiphy1_ep_ml>;
+							};
+						};
+					};
+				};
+			};
+
+			camss_ml: isp-ml@ad27000 {
+				compatible = "qcom,sm8750-camss";
+				reg = <0xad27000 0x2b00>,
+				      <0xad2a000 0x2b00>,
+				      <0xad2d000 0x2b00>,
+				      <0xad6d000 0xa00>,
+				      <0xad72000 0xa00>,
+				      <0xada9000 0x2000>,
+				      <0xadab000 0x2000>,
+				      <0xadad000 0x2000>,
+				      <0xadaf000 0x2000>,
+				      <0xadb1000 0x2000>,
+				      <0xadb3000 0x2000>,
+				      <0xad8b000 0x400>,
+				      <0xad8c000 0x400>,
+				      <0xad8d000 0x400>,
+				      <0xac86000 0x10000>,
+				      <0xac96000 0x10000>,
+				      <0xaca6000 0x10000>,
+				      <0xad6e000 0x3000>,
+				      <0xad73000 0x3000>;
+				reg-names = "csid0",
+					    "csid1",
+					    "csid2",
+					    "csid_lite0",
+					    "csid_lite1",
+					    "csiphy0",
+					    "csiphy1",
+					    "csiphy2",
+					    "csiphy3",
+					    "csiphy4",
+					    "csiphy5",
+					    "csitpg0",
+					    "csitpg1",
+					    "csitpg2",
+					    "vfe0",
+					    "vfe1",
+					    "vfe2",
+					    "vfe_lite0",
+					    "vfe_lite1";
+
+				clocks = <&camcc_ml CAM_CC_CAMNOC_NRT_AXI_CLK>,
+					 <&camcc_ml CAM_CC_CAMNOC_RT_AXI_CLK>,
+					 <&camcc_ml CAM_CC_CAM_TOP_AHB_CLK>,
+					 <&camcc_ml CAM_CC_CAM_TOP_FAST_AHB_CLK>,
+					 <&camcc_ml CAM_CC_CAMNOC_RT_TFE_0_MAIN_CLK>,
+					 <&camcc_ml CAM_CC_CAMNOC_RT_TFE_1_MAIN_CLK>,
+					 <&camcc_ml CAM_CC_CAMNOC_RT_TFE_2_MAIN_CLK>,
+					 <&camcc_ml CAM_CC_CAMNOC_RT_IFE_LITE_CLK>,
+					 <&camcc_ml CAM_CC_CAMNOC_RT_TFE_0_BAYER_CLK>,
+					 <&camcc_ml CAM_CC_CAMNOC_RT_TFE_1_BAYER_CLK>,
+					 <&camcc_ml CAM_CC_CAMNOC_RT_TFE_2_BAYER_CLK>,
+					 <&camcc_ml CAM_CC_CSID_CLK>,
+					 <&camcc_ml CAM_CC_CSID_CSIPHY_RX_CLK>,
+					 <&camcc_ml CAM_CC_CSIPHY0_CLK>,
+					 <&camcc_ml CAM_CC_CSI0PHYTIMER_CLK>,
+					 <&camcc_ml CAM_CC_CSIPHY1_CLK>,
+					 <&camcc_ml CAM_CC_CSI1PHYTIMER_CLK>,
+					 <&camcc_ml CAM_CC_CSIPHY2_CLK>,
+					 <&camcc_ml CAM_CC_CSI2PHYTIMER_CLK>,
+					 <&camcc_ml CAM_CC_CSIPHY3_CLK>,
+					 <&camcc_ml CAM_CC_CSI3PHYTIMER_CLK>,
+					 <&camcc_ml CAM_CC_CSIPHY4_CLK>,
+					 <&camcc_ml CAM_CC_CSI4PHYTIMER_CLK>,
+					 <&camcc_ml CAM_CC_CSIPHY5_CLK>,
+					 <&camcc_ml CAM_CC_CSI5PHYTIMER_CLK>,
+					 <&gcc GCC_CAMERA_HF_AXI_CLK>,
+					 <&gcc GCC_CAMERA_SF_AXI_CLK>,
+					 <&camcc_ml CAM_CC_TFE_0_MAIN_CLK>,
+					 <&camcc_ml CAM_CC_TFE_0_MAIN_FAST_AHB_CLK>,
+					 <&camcc_ml CAM_CC_TFE_1_MAIN_CLK>,
+					 <&camcc_ml CAM_CC_TFE_1_MAIN_FAST_AHB_CLK>,
+					 <&camcc_ml CAM_CC_TFE_2_MAIN_CLK>,
+					 <&camcc_ml CAM_CC_TFE_2_MAIN_FAST_AHB_CLK>,
+					 <&camcc_ml CAM_CC_TFE_0_BAYER_CLK>,
+					 <&camcc_ml CAM_CC_TFE_0_BAYER_FAST_AHB_CLK>,
+					 <&camcc_ml CAM_CC_TFE_1_BAYER_CLK>,
+					 <&camcc_ml CAM_CC_TFE_1_BAYER_FAST_AHB_CLK>,
+					 <&camcc_ml CAM_CC_TFE_2_BAYER_CLK>,
+					 <&camcc_ml CAM_CC_TFE_2_BAYER_FAST_AHB_CLK>,
+					 <&camcc_ml CAM_CC_IFE_LITE_CLK>,
+					 <&camcc_ml CAM_CC_IFE_LITE_AHB_CLK>,
+					 <&camcc_ml CAM_CC_IFE_LITE_CPHY_RX_CLK>,
+					 <&camcc_ml CAM_CC_IFE_LITE_CSID_CLK>,
+					 <&camcc_ml CAM_CC_QDSS_DEBUG_XO_CLK>;
+				clock-names = "camnoc_nrt_axi",
+					      "camnoc_rt_axi",
+					      "cpas_ahb",
+					      "cpas_fast_ahb",
+					      "cpas_vfe0",
+					      "cpas_vfe1",
+					      "cpas_vfe2",
+					      "cpas_vfe_lite",
+					      "cpas_vfe0_bayer",
+					      "cpas_vfe1_bayer",
+					      "cpas_vfe2_bayer",
+					      "csid",
+					      "csid_csiphy_rx",
+					      "csiphy0",
+					      "csiphy0_timer",
+					      "csiphy1",
+					      "csiphy1_timer",
+					      "csiphy2",
+					      "csiphy2_timer",
+					      "csiphy3",
+					      "csiphy3_timer",
+					      "csiphy4",
+					      "csiphy4_timer",
+					      "csiphy5",
+					      "csiphy5_timer",
+					      "gcc_axi_hf",
+					      "gcc_axi_sf",
+					      "vfe0",
+					      "vfe0_fast_ahb",
+					      "vfe1",
+					      "vfe1_fast_ahb",
+					      "vfe2",
+					      "vfe2_fast_ahb",
+					      "vfe0_bayer",
+					      "vfe0_bayer_fast_ahb",
+					      "vfe1_bayer",
+					      "vfe1_bayer_fast_ahb",
+					      "vfe2_bayer",
+					      "vfe2_bayer_fast_ahb",
+					      "vfe_lite",
+					      "vfe_lite_ahb",
+					      "vfe_lite_cphy_rx",
+					      "vfe_lite_csid",
+					      "qdss_debug_xo";
+
+				interrupts = <GIC_SPI 601 IRQ_TYPE_EDGE_RISING>,
+					     <GIC_SPI 603 IRQ_TYPE_EDGE_RISING>,
+					     <GIC_SPI 431 IRQ_TYPE_EDGE_RISING>,
+					     <GIC_SPI 605 IRQ_TYPE_EDGE_RISING>,
+					     <GIC_SPI 376 IRQ_TYPE_EDGE_RISING>,
+					     <GIC_SPI 477 IRQ_TYPE_EDGE_RISING>,
+					     <GIC_SPI 478 IRQ_TYPE_EDGE_RISING>,
+					     <GIC_SPI 479 IRQ_TYPE_EDGE_RISING>,
+					     <GIC_SPI 448 IRQ_TYPE_EDGE_RISING>,
+					     <GIC_SPI 122 IRQ_TYPE_EDGE_RISING>,
+					     <GIC_SPI 89 IRQ_TYPE_EDGE_RISING>,
+					     <GIC_SPI 433 IRQ_TYPE_EDGE_RISING>,
+					     <GIC_SPI 436 IRQ_TYPE_EDGE_RISING>,
+					     <GIC_SPI 457 IRQ_TYPE_EDGE_RISING>,
+					     <GIC_SPI 606 IRQ_TYPE_EDGE_RISING>,
+					     <GIC_SPI 377 IRQ_TYPE_EDGE_RISING>;
+				interrupt-names = "csid0",
+						  "csid1",
+						  "csid2",
+						  "csid_lite0",
+						  "csid_lite1",
+						  "csiphy0",
+						  "csiphy1",
+						  "csiphy2",
+						  "csiphy3",
+						  "csiphy4",
+						  "csiphy5",
+						  "vfe0",
+						  "vfe1",
+						  "vfe2",
+						  "vfe_lite0",
+						  "vfe_lite1";
+
+				iommus = <&apps_smmu_ml 0x1c00 0x0>;
+
+				power-domains = <&camcc_ml CAM_CC_TFE_0_GDSC>,
+						<&camcc_ml CAM_CC_TFE_1_GDSC>,
+						<&camcc_ml CAM_CC_TFE_2_GDSC>,
+						<&camcc_ml CAM_CC_TITAN_TOP_GDSC>;
+				power-domain-names = "ife0",
+						     "ife1",
+						     "ife2",
+						     "top";
+
+				vdd-csiphy0-0p9-supply = <&cam_csiphy_rails_ml>;
+				vdd-csiphy0-1p2-supply = <&cam_csiphy_rails_ml>;
+				vdd-csiphy1-0p9-supply = <&cam_csiphy_rails_ml>;
+				vdd-csiphy1-1p2-supply = <&cam_csiphy_rails_ml>;
+				vdd-csiphy2-0p9-supply = <&cam_csiphy_rails_ml>;
+				vdd-csiphy2-1p2-supply = <&cam_csiphy_rails_ml>;
+				vdd-csiphy3-0p9-supply = <&cam_csiphy_rails_ml>;
+				vdd-csiphy3-1p2-supply = <&cam_csiphy_rails_ml>;
+				vdd-csiphy4-0p9-supply = <&cam_csiphy_rails_ml>;
+				vdd-csiphy4-1p2-supply = <&cam_csiphy_rails_ml>;
+				vdd-csiphy5-0p9-supply = <&cam_csiphy_rails_ml>;
+				vdd-csiphy5-1p2-supply = <&cam_csiphy_rails_ml>;
+
+				ports {
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					port@1 {
+						reg = <1>;
+
+						csiphy1_ep_ml: endpoint {
+							data-lanes = <0 1 2 3>;
+							remote-endpoint = <&cam_wide_ep_ml>;
+						};
+					};
+
+					port@4 {
+						reg = <4>;
+
+						csiphy4_ep_ml: endpoint {
+							data-lanes = <0 1 2 3>;
+							remote-endpoint = <&cam_front_ep_ml>;
+						};
+					};
+				};
+			};
+		};
+	};
+
+	/* front sensor bus: the stock se9 node, made a mainline geni-i2c */
+	fragment@344 {
+		target = <&qupv3_se9_i2c>;
+		__overlay__ {
+			compatible = "qcom,geni-i2c";
+			clocks = <&gcc GCC_QUPV3_WRAP2_S1_CLK>;
+			clock-names = "se";
+			interconnects = <&clk_virt MASTER_QUP_CORE_2 QCOM_ICC_TAG_ALWAYS
+					 &clk_virt SLAVE_QUP_CORE_2 QCOM_ICC_TAG_ALWAYS>,
+					<&gem_noc MASTER_APPSS_PROC QCOM_ICC_TAG_ALWAYS
+					 &config_noc SLAVE_QUP_2 QCOM_ICC_TAG_ALWAYS>,
+					<&aggre2_noc MASTER_QUP_2 QCOM_ICC_TAG_ALWAYS
+					 &mc_virt SLAVE_EBI1 QCOM_ICC_TAG_ALWAYS>;
+			interconnect-names = "qup-core", "qup-config", "qup-memory";
+			dmas = <&gpi_dma2 0 1 QCOM_GPI_I2C>,
+			       <&gpi_dma2 1 1 QCOM_GPI_I2C>;
+			dma-names = "tx", "rx";
+			pinctrl-names = "default", "sleep";
+			pinctrl-0 = <&cam_i2c9_ml>;
+			/* The stock "sleep" state is in the driverless stock TLMM. */
+			pinctrl-1 = <&cam_i2c9_ml>;
+			clock-frequency = <1000000>;
+
+			camera@10 {
+				compatible = "ovti,ov32d40";
+				reg = <0x10>;
+				power-domains = <&camcc_ml CAM_CC_TITAN_TOP_GDSC>;
+				clocks = <&cambistmclkcc_ml CAM_BIST_MCLK_CC_MCLK4_CLK>;
+				reset-gpios = <&piano_tlmm_ml 7 GPIO_ACTIVE_LOW>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&cam_front_ml>;
+				vddio-supply = <&vreg_l10b_1p8_ml>;
+				dvdd-supply = <&vreg_l2g_1p2_ml>;
+				avdd-supply = <&cam_front_avdd_ml>;
+				orientation = <0>;
+				rotation = <0>;
+
+				port {
+					cam_front_ep_ml: endpoint {
+						data-lanes = <1 2 3 4>;
+						link-frequencies = /bits/ 64 <842400000>;
+						remote-endpoint = <&csiphy4_ep_ml>;
+					};
+				};
+			};
+		};
+	};
+
+	fragment@345 {
+		target-path = "/soc/qcom,qupv3_2_geni_se@8c0000/i2c@884000/qcom,cam-sensor1";
+		__overlay__ {
+			status = "disabled";
+		};
+	};
+
+	fragment@346 {
+		target-path = "/soc/qcom,qupv3_2_geni_se@8c0000/i2c@884000/qcom,eeprom1";
+		__overlay__ {
+			status = "disabled";
+		};
+	};
+};

@@ -1,0 +1,183 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* ADSP/CDSP/audio/sensor subsystem profile on top of the display overlay.
+ *
+ * The stock vendor tree defines the ADSP remoteproc and its reserved
+ * regions inside stock dtbo fragments.  ABL shifts references written in
+ * those fragments twice, so they dangle; every reference the mainline
+ * drivers depend on is re-stated below from our own fragments, where it is
+ * shifted once like the node phandles it points at.
+ */
+#include "dtbo-piano-display.dts"
+#include <dt-bindings/clock/qcom,sm8750-gcc.h>
+#include <dt-bindings/dma/qcom-gpi.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/linux-event-codes.h>
+#include <dt-bindings/interconnect/qcom,icc.h>
+#include <dt-bindings/interconnect/qcom,sm8750-rpmh.h>
+#include <dt-bindings/power/qcom,rpmhpd.h>
+
+/ {
+	/* ADSP: memory-region in the stock fragment resolves to nothing
+	 * ("unable to resolve memory-region"): re-state it.
+	 */
+	fragment@280 {
+		target = <&soc>;
+		__overlay__ {
+			remoteproc-adsp@03000000 {
+				memory-region = <&adspslpi_mem>, <&q6_adsp_dtb_mem>;
+				/* The stock node votes cx/mx through arc-regulator
+				 * supplies that nothing binds; the mainline driver
+				 * takes LCX/LMX from rpmhpd instead.
+				 */
+				power-domains = <&rpmhpd_ml RPMHPD_LCX>,
+						<&rpmhpd_ml RPMHPD_LMX>;
+				power-domain-names = "lcx", "lmx";
+				/* Start from sysfs so bring-up controls the moment
+				 * the firmware touches shared resources.
+				 */
+				qcom,no-auto-boot;
+			};
+		};
+	};
+
+	/* The stock LOGS pmic_glink node shares the compatible we added to the
+	 * kernel for the main node; two matches create duplicate pmic_glink
+	 * auxiliary devices.  Only PMIC_RTR_ADSP_APPS is served.
+	 */
+	fragment@281 {
+		target-path = "/soc/qcom,pmic_glink_log";
+		__overlay__ {
+			compatible = "qcom,qti-pmic-glink-log";
+		};
+	};
+
+	/*
+	 * Battery fuel gauges: two bq27z561 at 0x55, one per cell (parallel
+	 * pack, 2 x 4620 mAh).  The master is on QUP1 SE5 (gpio52/53), the
+	 * slave on QUP2 SE3 = stock se11 (gpio12/13).  The stock nodes use the
+	 * vendor "ti,bq27z561_master/_slave" compatibles and a pinctrl-0 that
+	 * points into the driverless stock TLMM; both are re-stated here.
+	 * The stock batt_ctl gpios (112/113) stay as the bootloader left them.
+	 */
+	fragment@285 {
+		target-path = "/soc";
+		__overlay__ {
+			pinctrl@f100000 {
+				piano_fg_i2c5_ml: fg-i2c5-state {
+					pins = "gpio52", "gpio53";
+					function = "qup1_se5";
+					drive-strength = <2>;
+					bias-pull-up;
+				};
+
+				piano_fg_i2c11_ml: fg-i2c11-state {
+					pins = "gpio12", "gpio13";
+					function = "qup2_se3";
+					drive-strength = <2>;
+					bias-pull-up;
+				};
+			};
+		};
+	};
+
+	fragment@286 {
+		target = <&qupv3_se5_i2c>;
+		__overlay__ {
+			compatible = "qcom,geni-i2c";
+			clocks = <&gcc GCC_QUPV3_WRAP1_S5_CLK>;
+			clock-names = "se";
+			interconnects = <&clk_virt MASTER_QUP_CORE_1 QCOM_ICC_TAG_ALWAYS
+					 &clk_virt SLAVE_QUP_CORE_1 QCOM_ICC_TAG_ALWAYS>,
+					<&gem_noc MASTER_APPSS_PROC QCOM_ICC_TAG_ALWAYS
+					 &config_noc SLAVE_QUP_1 QCOM_ICC_TAG_ALWAYS>,
+					<&aggre1_noc MASTER_QUP_1 QCOM_ICC_TAG_ALWAYS
+					 &mc_virt SLAVE_EBI1 QCOM_ICC_TAG_ALWAYS>;
+			interconnect-names = "qup-core", "qup-config", "qup-memory";
+			dmas = <&gpi_dma1 0 5 QCOM_GPI_I2C>,
+			       <&gpi_dma1 1 5 QCOM_GPI_I2C>;
+			dma-names = "tx", "rx";
+			pinctrl-names = "default", "sleep";
+			pinctrl-0 = <&piano_fg_i2c5_ml>;
+			pinctrl-1 = <&piano_fg_i2c5_ml>;
+			clock-frequency = <400000>;
+
+			bq27z561_master@55 {
+				compatible = "ti,bq27z561";
+				pinctrl-names = "default";
+				pinctrl-0 = <>;
+			};
+
+			/*
+			 * SC8541 2:1 switched-capacitor stage (stock 67 W
+			 * direct charging).  The stock node has the vendor
+			 * "sc8541_master" compatible and a dangling pinctrl-0;
+			 * sc8541_charger polls it, cp-int stays unused.  Only
+			 * piano-adsp loads the driver, with CHARGE_CP=1.
+			 */
+			sc8541_master@6a {
+				compatible = "southchip,sc8541";
+				pinctrl-names = "default";
+				pinctrl-0 = <>;
+			};
+		};
+	};
+
+	fragment@287 {
+		target = <&qupv3_se11_i2c>;
+		__overlay__ {
+			compatible = "qcom,geni-i2c";
+			clocks = <&gcc GCC_QUPV3_WRAP2_S3_CLK>;
+			clock-names = "se";
+			interconnects = <&clk_virt MASTER_QUP_CORE_2 QCOM_ICC_TAG_ALWAYS
+					 &clk_virt SLAVE_QUP_CORE_2 QCOM_ICC_TAG_ALWAYS>,
+					<&gem_noc MASTER_APPSS_PROC QCOM_ICC_TAG_ALWAYS
+					 &config_noc SLAVE_QUP_2 QCOM_ICC_TAG_ALWAYS>,
+					<&aggre2_noc MASTER_QUP_2 QCOM_ICC_TAG_ALWAYS
+					 &mc_virt SLAVE_EBI1 QCOM_ICC_TAG_ALWAYS>;
+			interconnect-names = "qup-core", "qup-config", "qup-memory";
+			dmas = <&gpi_dma2 0 3 QCOM_GPI_I2C>,
+			       <&gpi_dma2 1 3 QCOM_GPI_I2C>;
+			dma-names = "tx", "rx";
+			pinctrl-names = "default", "sleep";
+			pinctrl-0 = <&piano_fg_i2c11_ml>;
+			pinctrl-1 = <&piano_fg_i2c11_ml>;
+			clock-frequency = <400000>;
+
+			bq27z561_slave@55 {
+				compatible = "ti,bq27z561";
+				pinctrl-names = "default";
+				pinctrl-0 = <>;
+			};
+		};
+	};
+
+	/*
+	 * Keyboard-cover lid hall, straight on TLMM (stock xiaomi-hall:
+	 * lid_hall gpio80, active low).  The stock node also routes it through
+	 * smp2p for wakeup; the line is read directly here.
+	 *
+	 * The stock table_hall (gpio11) is not exposed as SW_TABLET_MODE: it
+	 * stays 0 with the detachable keyboard removed, and mutter trusts a
+	 * tablet-mode switch over "touchscreen and no pointer", so auto-rotate
+	 * never engaged while the switch existed.
+	 */
+	fragment@288 {
+		target-path = "/soc";
+		__overlay__ {
+			piano_hall_ml: piano-hall-ml {
+				compatible = "gpio-keys";
+				/* Names the input device the power-button service opens */
+				label = "hall_lid";
+
+				lid-switch {
+					label = "lid_hall";
+					gpios = <&piano_tlmm_ml 80 GPIO_ACTIVE_LOW>;
+					linux,input-type = <EV_SW>;
+					linux,code = <SW_LID>;
+					debounce-interval = <30>;
+					wakeup-source;
+				};
+			};
+		};
+	};
+};

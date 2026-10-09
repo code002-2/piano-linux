@@ -1,0 +1,108 @@
+#!/bin/sh
+# piano-audio-test — ADSP/audioreach audio chain, stage by stage.
+#
+# Success ladder:
+#   1. ADSP remoteproc online
+#   2. APR/GPR + audioreach services came up (q6apm/q6prm)
+#   3. LPASS macros bound (rx/tx/wsa/wsa2/va)
+#   4. SoundWire buses scanned, speakers + WCD9395 slaves enumerated
+#   5. ASoC sound card registered
+#   6. --play: audible 440/880 Hz test tone through the speakers
+#
+# Usage: piano-audio-test [--play]
+
+PLAY=0
+[ "${1-}" = "--play" ] && PLAY=1
+
+pass=0; fail=0; skip=0
+ok()   { printf '  [ OK ] %s\n' "$*"; pass=$((pass + 1)); }
+bad()  { printf '  [FAIL] %s\n' "$*"; fail=$((fail + 1)); }
+skip() { printf '  [SKIP] %s\n' "$*"; skip=$((skip + 1)); }
+
+printf '== piano audio test ==\n'
+
+# 1. ADSP ---------------------------------------------------------------------
+adsp_state=""
+for r in /sys/class/remoteproc/remoteproc*; do
+    [ -d "$r" ] || continue
+    case "$(cat "$r/name" 2>/dev/null)" in
+        *adsp*) adsp_state=$(cat "$r/state" 2>/dev/null) ;;
+    esac
+done
+[ "$adsp_state" = "running" ] && ok "ADSP remoteproc running" || {
+    [ -n "$adsp_state" ] && bad "ADSP state: $adsp_state" \
+                          || skip "no ADSP remoteproc node"
+}
+
+# 2. audioreach services -------------------------------------------------------
+if dmesg | grep -qE 'q6apm|audioreach'; then
+    ok "audioreach services in dmesg"
+    dmesg | grep -iE 'q6apm|audioreach' | tail -3 | sed 's/^/       /'
+else
+    bad "no audioreach in dmesg (piano-pd-locator running? qrtr up?)"
+fi
+if dmesg | grep -qiE 'pdr.*(fail|timeout|locator)'; then
+    printf '       note: PDR messages present — check piano-pd-locator is alive\n'
+    dmesg | grep -iE 'pdr' | tail -2 | sed 's/^/       /'
+fi
+
+# 3. LPASS macros ---------------------------------------------------------------
+n_macro=0
+for m in rx tx wsa wsa2 va; do
+    dmesg | grep -qiE "lpass.*$m.?macro" && n_macro=$((n_macro + 1))
+done
+[ "$n_macro" -ge 4 ] && ok "LPASS macros probed ($n_macro/5 in dmesg)" \
+                     || bad "LPASS macros: only $n_macro/5 in dmesg (supplies/clocks)"
+
+# 4. SoundWire enumeration --------------------------------------------------------
+n_sdw_dev=$(ls /sys/bus/soundwire/devices/ 2>/dev/null | grep -c 'sdw')
+if [ "$n_sdw_dev" -gt 0 ]; then
+    ok "SoundWire slaves enumerated: $n_sdw_dev"
+    ls /sys/bus/soundwire/devices/ 2>/dev/null | sed 's/^/       /'
+else
+    skip "no soundwire devices (check dmesg | grep -i soundwire)"
+fi
+if dmesg | grep -qiE 'wsa884|sdw20217020400'; then
+    ok "WSA884x speaker amps seen (dmesg)"
+elif [ "$n_sdw_dev" -gt 0 ]; then
+    printf '       note: no WSA884x match — amp may be WSA883x (OQ#21): dmesg | grep -i sdw\n'
+fi
+if dmesg | grep -qiE 'wcd939'; then
+    ok "WCD9395 codec seen (dmesg)"
+else
+    bad "no WCD9395 in dmesg (reset gpio / supplies)"
+fi
+
+# 5. sound card -------------------------------------------------------------------
+if [ -r /proc/asound/cards ] && grep -q ':' /proc/asound/cards; then
+    ok "sound card registered"
+    cat /proc/asound/cards | sed 's/^/       /'
+    ls /sys/class/sound/ 2>/dev/null | tr '\n' ' ' | sed 's/^/       devs: /'; printf '\n'
+else
+    bad "no sound card in /proc/asound/cards (card probe needs 1-2 lines of dmesg)"
+    dmesg | grep -iE 'asoc|snd|sc8280xp' | tail -5 | sed 's/^/       /'
+fi
+
+# 6. playback ----------------------------------------------------------------------
+if [ "$PLAY" = 1 ]; then
+    if command -v aplay >/dev/null 2>&1 && [ -f /usr/share/piano-test-tone.wav ]; then
+        card=$(grep -m1 -oE '^ [0-9]+ \[[^]]+\]' /proc/asound/cards 2>/dev/null | grep -oE '[0-9]+')
+        if [ -n "$card" ]; then
+            printf '       playing 3 s test tone on card %s (listen for 440/880 Hz)...\n' "$card"
+            if aplay -D "plughw:$card,0" /usr/share/piano-test-tone.wav >/dev/null 2>&1 \
+               || aplay /usr/share/piano-test-tone.wav >/dev/null 2>&1; then
+                ok "playback completed (audible = full analog chain; silent = amps/routing)"
+            else
+                bad "aplay failed (PCM open error — see aplay stderr without redirect)"
+            fi
+        else
+            skip "--play: cannot parse card number"
+        fi
+    else
+        skip "--play: aplay or test tone missing"
+    fi
+fi
+
+printf -- '--- evidence: dmesg | grep -iE "asoc|q6apm|soundwire|wcd|wsa|remoteproc"\n'
+printf '== result: %d ok, %d fail, %d skip ==\n' "$pass" "$fail" "$skip"
+[ "$fail" -eq 0 ]

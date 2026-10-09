@@ -1,0 +1,334 @@
+#!/bin/sh
+# piano initramfs beaconinit — early bring-up debug environment.
+#
+# Boot contract: ABL v4 RAM boot concatenates the stock vendor_ramdisk after
+# ours, so the entry point must NOT be /init; the kernel cmdline forces
+# rdinit=/beaconinit (see build-initramfs.sh).
+#
+# Phase order is deliberate:
+#   1. beacon (bounded): proves userspace is alive on the framebuffer
+#   2. UDC wait: dwc3 comes up via a long deferred-probe chain
+#      (rpmhcc -> gcc -> icc -> rpmhpd -> phy -> dwc3), give it 120 s
+#   3. NCM gadget + udhcpd + dropbear
+#   4. diagnostics dump printed AFTER the beacon stopped, so fbcon text
+#      stays visible on screen (the beacon scrubs the framebuffer)
+
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+
+/bin/busybox --install -s /bin 2>/dev/null
+
+CON=/dev/console
+say() { echo "piano: $*" > "$CON" 2>/dev/null; echo "piano: $*"; }
+
+mkdir -p /proc /sys /dev /run /tmp
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts /dev/shm
+mount -t devpts devpts /dev/pts
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t configfs configfs /sys/kernel/config
+
+# --- previous boot's console log (ramoops/pstore) -----------------------------
+# The kernel mirrors its console into the stock ramoops region; after a hard
+# reset the log of the boot that died shows up here. Keep a copy in /run.
+mkdir -p /sys/fs/pstore
+if mount -t pstore pstore /sys/fs/pstore 2>/dev/null; then
+  if [ -n "$(ls /sys/fs/pstore 2>/dev/null)" ]; then
+    mkdir -p /run/pstore-prev
+    cp /sys/fs/pstore/* /run/pstore-prev/ 2>/dev/null
+    say "pstore: previous boot log kept in /run/pstore-prev"
+  fi
+fi
+
+# --- apps SMMU: let the QUP1, QUP2 and PCIe DMA through -----------------------
+# ABL leaves the apps SMMU enabled with unmatched streams faulting (USFCFG=1).
+# Matched here, routed like the USB pass-through context:
+#   0xb6 0xa3  QUP1 GPI / SE   (touch SPI DMA)
+#   0x436 0x423 QUP2 GPI / SE  (uart14 SE DMA mode, BT HCI traffic)
+#   0x1400/0x7f PCIe0          (peach WLAN: stock smmu-sid-base 0x1400; the
+#                               iommu-map is dropped, so the BDF-to-SID
+#                               table is unprogrammed — cover the range)
+piano-qup-smmu 0xb6 0xa3 0x1400/0x7f 0x436 0x423 > /run/qup-smmu.log 2>&1 \
+  || say "WARN piano-qup-smmu failed (see /run/qup-smmu.log)"
+
+# --- framebuffer beacon (bounded) -------------------------------------------
+# Alternate white/black fills of the whole splash framebuffer so userspace
+# progress is visible with zero driver dependencies: /dev/fb0 when simpledrm
+# bound, otherwise raw /dev/mem at the downstream cont_splash region
+# 0xfc800000 (kernel built with STRICT_DEVMEM off). 20 rounds only — the
+# beacon deliberately scrubs fbcon text, so all diagnostics are printed
+# after it stops. /run/stop-beacon aborts it early.
+(
+  if [ -e /run/stop-beacon ]; then exit 0; fi
+  FB=/dev/fb0
+  [ -c "$FB" ] || FB=/dev/mem
+  if [ -c "$FB" ]; then
+    WHITE=/tmp/white.bin; BLACK=/tmp/black.bin
+    head -c 1048576 /dev/zero | tr '\000' '\377' > "$WHITE"
+    head -c 1048576 /dev/zero > "$BLACK"
+    SEEK=0; [ "$FB" = /dev/mem ] && SEEK=$((0xfc800000 / 1048576))
+    r=0
+    while [ $r -lt 1 ]; do
+      [ -e /run/stop-beacon ] && exit 0
+      i=0; while [ $i -lt 28 ]; do
+        dd if="$WHITE" of="$FB" bs=1048576 seek=$((SEEK + i)) count=1 2>/dev/null
+        i=$((i + 1))
+      done
+      sleep 0.3
+      i=0; while [ $i -lt 28 ]; do
+        dd if="$BLACK" of="$FB" bs=1048576 seek=$((SEEK + i)) count=1 2>/dev/null
+        i=$((i + 1))
+      done
+      sleep 0.3
+      r=$((r + 1))
+    done
+  fi
+) &
+
+# --- wait for the DWC3 UDC (deferred probe chain) ----------------------------
+say "waiting for UDC (dwc3 deferred-probe chain, up to 120s)"
+UDC=""
+w=0
+while [ $w -lt 20 ]; do
+  for u in /sys/class/udc/*; do [ -e "$u" ] && UDC=${u##*/} && break 2; done
+  sleep 2
+  w=$((w + 2))
+  [ $((w % 60)) -eq 0 ] && say "still waiting for UDC (${w}s)"
+done
+
+# --- diagnostics (printed after the beacon stopped, so text survives) -------
+diag() {
+  say "=== DIAG2 udc='${UDC:-none}' ==="
+  say "--- /sys/class/udc:"
+  ls /sys/class/udc/ > "$CON" 2>&1
+  say "--- usb/dwc3/phy lines (sync_state filtered):"
+  dmesg | grep -iE 'dwc3|ssusb|eusb2|m31|qmp|udc|gadget|phy' | grep -vE 'sync_state|Fixed dependency' | tail -40 > "$CON" 2>&1
+  say "--- EBUSY detail:"
+dmesg | grep -iE 'EBUSY|can.t request' | tail -6 > "$CON" 2>&1
+  say "--- qmp iomem + resources:"
+  grep -iE '88e[0-9a-f]{4}' /proc/iomem > "$CON" 2>&1
+  for d in /sys/bus/platform/devices/*ssphy*; do
+    [ -d "$d" ] && { say "[$d]"; cat "$d/resources" > "$CON" 2>&1; }
+  done
+  say "--- probe failures/errors:"
+dmesg | grep -iE 'fail|error|abort|unable' | grep -vE 'sync_state|deferr' | tail -15 > "$CON" 2>&1
+}
+diag_loop() {
+  while [ ! -e /run/stop-diag ]; do
+    diag
+    say "(loop: touch /run/stop-diag to stop)"
+    sleep 20
+  done
+}
+
+if [ -z "$UDC" ]; then
+  say "NO UDC after 120s — dumping probe state"
+  diag_loop &
+  exec setsid cttyhack /bin/sh
+fi
+say "UDC found: $UDC"
+
+# --- USB NCM gadget ---------------------------------------------------------
+GADGET=/sys/kernel/config/usb_gadget/piano
+mkdir -p "$GADGET" || { diag; exec setsid cttyhack /bin/sh; }
+
+echo 0x18d1 > "$GADGET/idVendor"   # Google
+echo 0xd001 > "$GADGET/idProduct"  # generic NCM debug gadget
+echo 0x0100 > "$GADGET/bcdDevice"
+echo 0x0200 > "$GADGET/bcdUSB"
+
+mkdir -p "$GADGET/strings/0x409"
+echo "piano-linux"     > "$GADGET/strings/0x409/manufacturer"
+echo "piano NCM debug" > "$GADGET/strings/0x409/product"
+echo "0123456789"      > "$GADGET/strings/0x409/serialnumber"
+
+mkdir -p "$GADGET/functions/ncm.usb0"
+# Fixed test MACs: locally administered, collision-free on the point-to-point link
+echo "02:11:22:33:44:55" > "$GADGET/functions/ncm.usb0/dev_addr"
+echo "02:66:77:88:99:aa" > "$GADGET/functions/ncm.usb0/host_addr"
+
+mkdir -p "$GADGET/configs/b.1/strings/0x409"
+echo "ncm" > "$GADGET/configs/b.1/strings/0x409/configuration"
+echo 500  > "$GADGET/configs/b.1/MaxPower"
+ln -sf "$GADGET/functions/ncm.usb0" "$GADGET/configs/b.1"
+
+echo "$UDC" > "$GADGET/UDC" || { say "gadget bind to $UDC FAILED"; diag; exec setsid cttyhack /bin/sh; }
+say "NCM gadget bound to $UDC"
+
+# --- Network on usb0 --------------------------------------------------------
+ip link set usb0 up    || say "WARN ip link usb0 up failed"
+ip addr add 10.42.0.2/24 dev usb0 || say "WARN ip addr usb0 failed"
+
+cat > /tmp/udhcpd.conf <<EOF
+interface usb0
+start 10.42.0.10
+end 10.42.0.20
+opt dns 10.42.0.2
+opt subnet 255.255.255.0
+opt router 10.42.0.2
+opt lease 3600
+EOF
+mkdir -p /var/lib/misc && touch /var/lib/misc/udhcpd.leases
+udhcpd /tmp/udhcpd.conf >/run/udhcpd.log 2>&1 &
+say "udhcpd launched (host: static 10.42.0.1/24)"
+
+# --- dropbear ---------------------------------------------------------------
+mkdir -p /etc/dropbear /root/.ssh
+# The staged dropbear tree includes its shared-library closure. Detect a
+# broken/stale tool tree; legacy test mode still keeps telnet below.
+if timeout 15 dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key >/run/dbk.log 2>&1; then
+  dropbear -E -B -p 22 >/run/dropbear.log 2>&1 && say "dropbear up on :22"
+else
+  say "dropbear unusable ($(head -c 80 /run/dbk.log 2>/dev/null)); telnetd fallback"
+fi
+busybox telnetd -p 23 -l /bin/sh && say "telnetd up on :23" || say "WARN telnetd failed"
+# Evidence pull over the USB link: http://10.42.0.2:8080/<file under /run>
+busybox httpd -p 8080 -h /run && say "httpd serving /run on :8080" || say "WARN httpd failed"
+
+say "debug environment up: NCM 10.42.0.2, ssh root@10.42.0.2"
+
+# --- WLAN/BT staged bring-up (peach combo), background -----------------------
+# One subsystem at a time, a kmsg marker before each step (pstore keeps the
+# console of a boot that dies) and everything collected under /run (served
+# on http :8080):
+#   /run/wlanbt-stages.log   step-by-step evidence
+#   /run/wlanbt-dmesg-*.log  full dmesg after each phase
+# Bluetooth goes first and on its own: phy-qcom-qmp-pcie is not loaded until
+# the WLAN phase, so pcie0 (built-in, its root port references that PHY)
+# stays unprobed while TLMM, the PMU and hci_qca come up.
+# `touch /run/wlan-hold` before the WLAN phase starts parks the ladder there
+# until the file is removed (the BT evidence can be fetched first).
+(
+  LOG=/run/wlanbt-stages.log
+  : > "$LOG"
+  stage() {
+    echo "piano-wlanbt: STAGE $1 ($2)" > /dev/kmsg
+    echo "=== STAGE $1 ($2) ===" >> "$LOG"
+  }
+  snap() { dmesg > "/run/wlanbt-dmesg-$1.log" 2>&1; }
+  # BT liveness: one Read BD_ADDR round trip (a dead controller shows up as
+  # a missing BD_ADDR line and a "command tx timeout" in dmesg), plus the
+  # hci_qca in-band-sleep counters
+  bt_probe() {
+    echo "--- BT probe ($1, uptime $(cut -d' ' -f1 /proc/uptime)):" >> "$LOG"
+    piano-bt-scan 0 0 2>&1 | grep 'BD_ADDR' >> "$LOG" \
+      || echo "no BD_ADDR: controller not answering" >> "$LOG"
+    for f in ibs_sent_sleeps ibs_sent_wakes ibs_recv_wake_acks ibs_recv_sleeps \
+             ibs_recv_wakes tx_ibs_state rx_ibs_state; do
+      printf '%s=%s ' "$f" "$(cat /sys/kernel/debug/bluetooth/hci0/ibs/$f 2>/dev/null)"
+    done >> "$LOG"
+    echo >> "$LOG"
+  }
+  grep -q ' /sys/kernel/debug ' /proc/mounts || mount -t debugfs none /sys/kernel/debug
+  sleep 8
+
+  stage 1 "BT: shared-gpio proxy, WCN PMU, TLMM, hci_uart"
+  modprobe gpio_shared_proxy >> "$LOG" 2>&1
+  modprobe pwrseq_qcom_wcn >> "$LOG" 2>&1
+  modprobe pinctrl_sm8750 >> "$LOG" 2>&1
+  sleep 3
+  ls -l /sys/bus/platform/devices/wcn7850-pmu/driver >> "$LOG" 2>&1
+  ls -l /sys/bus/platform/devices/898000.serial/driver >> "$LOG" 2>&1
+  # One setup attempt, no power-cycle retries (each retry costs ~30 s of
+  # HCI timeouts).  Brahma v2 downloads at 115200 with paced segments
+  # (~25 s for the rampatch), as the stock HAL does.
+  echo "--- AOSS QMP (PDC votes for the WCN PMU):" >> "$LOG"
+  ls -l /sys/bus/platform/devices/c300000.power-controller/driver >> "$LOG" 2>&1
+  bt_ok=no
+  # piano_peri=106: PERI to 8 Mbaud, arbitrate, patch the Brahma PERI subsystem
+  # (brhperifw20.tlv + brhperinv20.bin, PERI reset, re-activate BT) before
+  # the BT rampatch, then wake BT and re-read its version (unpatched PERI
+  # ROM crashes about a minute after setup)
+  modprobe hci_uart piano_retries=0 piano_peri=106 >> "$LOG" 2>&1
+  # the uart14 probe (and with it hci0) only lands ~10 s later
+  n=0
+  while ! dmesg | grep -q 'hci0: setting up' && [ $n -lt 30 ]; do sleep 1; n=$((n + 1)); done
+  n=0
+  while [ $n -lt 75 ]; do
+    if dmesg | grep -q 'setup on UART is completed'; then bt_ok=yes; break; fi
+    dmesg | grep -qE 'Failed to request file|setup failed|Retry BT power ON' && break
+    sleep 1; n=$((n + 1))
+  done
+  dmesg | grep -iE 'bluetooth|hci|qca|piano-dbg: baud|serdev|898000' >> "$LOG" 2>&1
+  echo "--- BT result: ${bt_ok} ---" >> "$LOG"
+  if [ "$bt_ok" = yes ]; then
+    echo "--- piano-bt-scan (hci0 up + 10 s LE scan):" >> "$LOG"
+    piano-bt-scan 0 10 >> "$LOG" 2>&1
+    echo "piano-bt-scan exit $?" >> "$LOG"
+    # does the controller survive idling (RF_CLK1 vote, in-band sleep)?
+    # probed before WLAN powers the other half of the combo
+    sleep 20; bt_probe "idle 20 s"
+    sleep 25; bt_probe "idle 45 s"
+    sleep 45; bt_probe "idle 90 s"
+    dmesg | grep -E 'hci0: (command tx timeout|Injecting|setup on UART)' >> "$LOG" 2>&1
+  fi
+  ls /sys/class/bluetooth/ >> "$LOG" 2>&1
+  snap bt
+  echo "piano-wlanbt: BT phase done (setup completed: $bt_ok)" > /dev/kmsg
+
+  echo "--- WLAN phase in 10 s (touch /run/wlan-hold to park it) ---" >> "$LOG"
+  sleep 10
+  while [ -e /run/wlan-hold ]; do sleep 2; done
+
+  stage 2 "WLAN: pci-pwrctrl-pwrseq, then the PCIe PHY (starts the pcie0 host probe)"
+  piano-qup-smmu --check 0x1400/0x7f >> "$LOG" 2>&1
+  modprobe pci_pwrctrl_pwrseq >> "$LOG" 2>&1
+  sleep 1
+  # PCIe0 reference clock: TCSR_PCIE_0_CLKREF_EN = bit 0 of 0x0f204008
+  # (tcsrcc-sm8750/tcsrcc-sun offset 0x0).  The overlay's tcsrcc sits on
+  # the wrong block (0x1fc0000), so the PHY gets a dummy clock and the
+  # real enable is set here.
+  echo "--- TCSR_PCIE_0_CLKREF_EN before/after:" >> "$LOG"
+  v=$(devmem 0x0f204008 32)
+  echo "$v" >> "$LOG"
+  devmem 0x0f204008 32 $((v | 1))
+  devmem 0x0f204008 32 >> "$LOG" 2>&1
+  echo "piano-wlanbt: pcie0 clkref $v -> $(devmem 0x0f204008 32)" > /dev/kmsg
+  # piano_skip_bcr: R16 reset on the core BCR assert, R18 on the next
+  # (PHY) BCR assert; pcie-qcom already skips the core one on sm8750
+  modprobe phy_qcom_qmp_pcie piano_skip_bcr=1 >> "$LOG" 2>&1
+  sleep 8
+  dmesg | grep -iE 'qcom-pcie|1c00000|pci|phy-qcom|pwrctrl|pwrseq' >> "$LOG" 2>&1
+  for d in /sys/bus/pci/devices/*; do
+    [ -r "$d/vendor" ] && echo "pci $(basename "$d"): $(cat "$d/vendor"):$(cat "$d/device")" >> "$LOG"
+  done
+  snap pcie
+
+  stage 3 "WLAN: qrtr + qrtr-mhi (QMI transport), ath12k (firmware + wiphy)"
+  # ath12k talks QMI over the MHI IPCR channel; nothing autoloads the
+  # socket family or the MHI client driver in this initramfs.
+  modprobe qrtr >> "$LOG" 2>&1
+  modprobe qrtr_mhi >> "$LOG" 2>&1
+  modprobe ath12k_wifi7 >> "$LOG" 2>&1
+  n=0
+  while [ -z "$(ls /sys/class/ieee80211/ 2>/dev/null)" ] && [ $n -lt 30 ]; do sleep 1; n=$((n + 1)); done
+  sleep 3
+  ls /sys/class/ieee80211/ >> "$LOG" 2>&1
+  iw dev >> "$LOG" 2>&1
+  # scan proof: bring the first wireless netdev up and list what it hears
+  wdev=$(ls /sys/class/net | while read -r d; do [ -d /sys/class/net/$d/wireless ] && echo "$d"; done | head -1)
+  if [ -n "$wdev" ]; then
+    ip link set "$wdev" up >> "$LOG" 2>&1
+    sleep 2
+    echo "--- scan on $wdev:" >> "$LOG"
+    iw dev "$wdev" scan 2>&1 | grep -E '^BSS|SSID:|signal:|freq:' | head -60 >> "$LOG"
+  fi
+  dmesg | grep -iE 'ath12k|mhi|wlan|ieee80211|qrtr' >> "$LOG" 2>&1
+  [ "$bt_ok" = yes ] && bt_probe "after the WLAN phase"
+  snap wlan
+  echo "piano-wlanbt: stages complete (see /run/wlanbt-stages.log)" > /dev/kmsg
+) &
+
+
+# Keep the display-safe image passive after NCM setup.  ADSP modules and
+# firmware remain staged for offline development, but no remoteproc, QRTR, or
+# RPMh client is loaded during boot.  This preserves the milestone-1 display
+# handoff while the ADSP power-domain wiring is being developed separately.
+say "ADSP trial disabled: display-safe boot"
+
+# Non-interactive boot smoke report in the background
+if command -v piano-tests >/dev/null 2>&1; then
+  ( sleep 5; piano-tests --auto > /run/boot-smoke.log 2>&1 ) &
+fi
+
+exec setsid cttyhack /bin/sh

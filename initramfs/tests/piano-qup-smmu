@@ -1,0 +1,103 @@
+#!/bin/sh
+# piano-qup-smmu — let the QUP1 GPI DMA through the apps SMMU.
+#
+# Usage: piano-qup-smmu [--check] [STREAM_ID[/MASK]...]   (default: 0xb6 0xa3)
+#
+# The kernel has no driver for the stock apps SMMU (qcom,qsmmu-v500 at
+# 0x15000000), so the SMMU stays as the bootloader left it: enabled, with
+# unmatched streams faulting (sCR0.USFCFG=1). ABL only installs stream
+# matches for what it uses itself (USB 0x40, display 0x800, ...), each
+# routed to a context bank with stage 1 disabled, i.e. pass-through. The
+# first GPI DMA of QUP1 (stream 0xb6; QUP1 SE stream 0xa3, stock
+# iommus properties) is then a translation fault, and piano resets.
+#
+# This adds a stream match for each ID, routed exactly like the USB stream,
+# in the first free stream-match slot. IDs that already match are left
+# alone, so running it twice is harmless. Only the SMR/S2CR tables of the
+# global register space are touched. --check only reports. An optional
+# /MASK (SMR mask bits) covers a whole stream range with one slot, e.g.
+# 0x1400/0x7f for every PCIe0 requester whatever the BDF-to-SID hash.
+
+B=$((0x15000000))
+USB_SID=$((0x40))
+CHECK=0
+
+[ "${1-}" = "--check" ] && { CHECK=1; shift; }
+[ $# -gt 0 ] || set -- 0xb6 0xa3
+
+rd() { printf '%d' "$(devmem $((B + $1)) 32)"; }
+wr() { devmem $((B + $1)) 32 "$2"; }
+die() { echo "piano-qup-smmu: $*" >&2; exit 1; }
+
+scr0=$(rd 0x0)
+idr0=$(rd 0x20)
+nsmr=$((idr0 & 0xff))
+[ $((scr0 & 1)) -eq 0 ] || { echo "SMMU disabled (sCR0.CLIENTPD), nothing to do"; exit 0; }
+if [ "$nsmr" -le 0 ] || [ "$nsmr" -gt 128 ]; then
+    die "unexpected NUMSMRG $nsmr (IDR0=$idr0)"
+fi
+printf 'sCR0=0x%08x USFCFG=%d stream-match groups=%d\n' "$scr0" $(((scr0 >> 10) & 1)) "$nsmr"
+
+# smr_match SID [MASK] -> index of a valid SMR covering SID (and every
+# stream the MASK adds), or nothing
+smr_match() {
+    want=${2:-0}
+    i=0
+    while [ $i -lt "$nsmr" ]; do
+        smr=$(rd $((0x800 + 4 * i)))
+        if [ $((smr >> 31 & 1)) -eq 1 ]; then
+            id=$((smr & 0xffff))
+            mask=$(((smr >> 16) & 0x7fff))
+            if [ $(( ($1 ^ id) & ~mask & 0xffff )) -eq 0 ] &&
+               [ $(( want & ~mask & 0x7fff )) -eq 0 ]; then
+                echo $i
+                return 0
+            fi
+        fi
+        i=$((i + 1))
+    done
+    return 1
+}
+
+usb_idx=$(smr_match $USB_SID) || die "no bootloader stream match for USB (0x40); refusing to guess a context bank"
+s2cr=$(rd $((0xc00 + 4 * usb_idx)))
+[ $(((s2cr >> 16) & 3)) -eq 0 ] || die "USB S2CR 0x$(printf %x "$s2cr") is not a translation context"
+cb=$((s2cr & 0xff))
+sctlr=$(rd $((0x80000 + 0x1000 * cb)))
+[ $((sctlr & 1)) -eq 0 ] || die "USB context bank $cb translates (SCTLR.M=1); not a pass-through"
+printf 'USB stream 0x40: slot %d, S2CR=0x%08x, context bank %d (stage 1 off)\n' "$usb_idx" "$s2cr" "$cb"
+
+for arg in "$@"; do
+    case "$arg" in
+        */*) sid=$((${arg%/*})); smask=$((${arg#*/})) ;;
+        *)   sid=$((arg)); smask=0 ;;
+    esac
+    [ $((smask & ~0x7fff)) -eq 0 ] || die "mask $arg out of range"
+    sid=$((sid & ~smask))
+    if idx=$(smr_match "$sid" "$smask"); then
+        printf 'stream 0x%x/0x%x: already matched in slot %d\n' "$sid" "$smask" "$idx"
+        continue
+    fi
+    [ "$CHECK" = 1 ] && { printf 'stream 0x%x/0x%x: NOT matched (would fault)\n' "$sid" "$smask"; continue; }
+    # a partial overlap with an existing match is a stream-match conflict
+    i=0
+    while [ $i -lt "$nsmr" ]; do
+        smr=$(rd $((0x800 + 4 * i)))
+        if [ $((smr >> 31 & 1)) -eq 1 ] &&
+           [ $(( (sid ^ (smr & 0xffff)) & ~(smask | ((smr >> 16) & 0x7fff)) & 0xffff )) -eq 0 ]; then
+            die "0x$(printf %x "$sid")/0x$(printf %x "$smask") overlaps slot $i (SMR=0x$(printf %x "$smr"))"
+        fi
+        i=$((i + 1))
+    done
+    free=0
+    while [ $free -lt "$nsmr" ] && [ $(($(rd $((0x800 + 4 * free))) >> 31 & 1)) -eq 1 ]; do
+        free=$((free + 1))
+    done
+    [ $free -lt "$nsmr" ] || die "no free stream-match slot"
+    # route first, then make the match valid
+    wr $((0xc00 + 4 * free)) "$s2cr"
+    wr $((0x800 + 4 * free)) $((0x80000000 | (smask << 16) | sid))
+    got=$(smr_match "$sid" "$smask") || die "stream 0x$(printf %x "$sid") still unmatched after the write"
+    printf 'stream 0x%x/0x%x: added in slot %d -> context bank %d\n' "$sid" "$smask" "$got" "$cb"
+done
+printf 'sGFSR=0x%08x\n' "$(rd 0x48)"

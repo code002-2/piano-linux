@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+[ -f /run/piano-smmu-ready ] || { echo 'SMMU initialization missing'; exit 1; }
+modprobe gpio_shared_proxy
+modprobe pwrseq_qcom_wcn
+modprobe pinctrl_sm8750
+modprobe hci_uart
+modprobe pci_pwrctrl_pwrseq
+# Only this verified register is safe; do not probe adjacent TLMM windows.
+v=$(/usr/lib/piano/busybox devmem 0x0f204008 32)
+/usr/lib/piano/busybox devmem 0x0f204008 32 "$((v | 1))"
+modprobe --ignore-install phy_qcom_qmp_pcie
+modprobe qrtr
+modprobe qrtr_mhi
+modprobe ath12k_wifi7

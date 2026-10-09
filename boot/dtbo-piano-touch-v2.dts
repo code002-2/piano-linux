@@ -1,0 +1,169 @@
+/*
+ * Touch bring-up overlay, second iteration.  The milestone-1 USB/display
+ * overlay stays the base; everything below only adds or overrides nodes of
+ * the touch path (QUP1 SE2 SPI -> NT36532 TDDI touch) and the pstore layout.
+ *
+ * Hardware facts come from the piano device tree that Xiaomi ships with its
+ * kernel sources (refer/MiCode_piano/kernel_devicetree/qcom/sun.dtsi,
+ * sun-pinctrl.dtsi, piano-xiaomi-touch-pinctrl.dtsi) and the mainline
+ * SM8750 description (linux-piano/arch/arm64/boot/dts/qcom/sm8750.dtsi).
+ *
+ * TLMM: the stock qcom,sun-tlmm node is left alone so that no stock GPIO
+ * consumer (fixed regulators, keys, ...) is wired up by accident.  A
+ * separate mainline node covers the same pin registers (0xf100000,
+ * 0x102000) and is referenced only by the touch path.  It is probed by the
+ * pinctrl-sm8750 module, which the test scripts load explicitly.
+ */
+#include "dtbo-piano-usb-nopd9.dts"
+#include <dt-bindings/dma/qcom-gpi.h>
+
+/ {
+	/* QUP1 wrapper that owns SE2 */
+	fragment@220 {
+		target-path = "/soc/qcom,qupv3_1_geni_se@ac0000";
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	/*
+	 * GPI DMA for QUP1: the SE runs in GSI mode (FIFO interface disabled).
+	 * Same register window, channel count and HLOS channel mask (0x1e) as
+	 * the stock node; only the binding is the mainline one.
+	 */
+	fragment@221 {
+		target-path = "/soc/qcom,gpi-dma@a00000";
+		__overlay__ {
+			compatible = "qcom,sm8750-gpi-dma", "qcom,sm6350-gpi-dma";
+			dma-channels = <12>;
+			dma-channel-mask = <0x1e>;
+			#dma-cells = <3>;
+			status = "okay";
+		};
+	};
+
+	/* SE2 as mainline GENI SPI master, pins muxed by the mainline TLMM */
+	fragment@222 {
+		target-path = "/soc/qcom,qupv3_1_geni_se@ac0000/spi@a88000";
+		__overlay__ {
+			compatible = "qcom,geni-spi";
+			clock-names = "se";
+			interconnects = <&clk_virt MASTER_QUP_CORE_1 QCOM_ICC_TAG_ALWAYS
+					 &clk_virt SLAVE_QUP_CORE_1 QCOM_ICC_TAG_ALWAYS>,
+					<&gem_noc MASTER_APPSS_PROC QCOM_ICC_TAG_ALWAYS
+					 &config_noc SLAVE_QUP_1 QCOM_ICC_TAG_ALWAYS>,
+					<&aggre1_noc MASTER_QUP_1 QCOM_ICC_TAG_ALWAYS
+					 &mc_virt SLAVE_EBI1 QCOM_ICC_TAG_ALWAYS>;
+			dmas = <&gpi_dma1 0 2 QCOM_GPI_SPI>,
+			       <&gpi_dma1 1 2 QCOM_GPI_SPI>;
+			/* keep the pins on the QUP function across runtime PM */
+			pinctrl-names = "default", "sleep";
+			pinctrl-0 = <&piano_ts_spi_default>;
+			pinctrl-1 = <&piano_ts_spi_default>;
+		};
+	};
+
+	fragment@223 {
+		target = <&clk_virt>;
+		__overlay__ {
+			compatible = "qcom,sm8750-clk-virt";
+			#interconnect-cells = <2>;
+			qcom,bcm-voter-names = "hlos";
+			qcom,bcm-voters = <&apps_bcm_voter_ml>;
+		};
+	};
+
+	fragment@224 {
+		target = <&cnoc_main>;
+		__overlay__ {
+			compatible = "qcom,sm8750-cnoc-main";
+			#interconnect-cells = <2>;
+			qcom,bcm-voter-names = "hlos";
+			qcom,bcm-voters = <&apps_bcm_voter_ml>;
+		};
+	};
+
+	fragment@225 {
+		target = <&system_noc>;
+		__overlay__ {
+			compatible = "qcom,sm8750-system-noc";
+			#interconnect-cells = <2>;
+			qcom,bcm-voter-names = "hlos";
+			qcom,bcm-voters = <&apps_bcm_voter_ml>;
+		};
+	};
+
+	fragment@226 {
+		target-path = "/soc";
+		__overlay__ {
+			piano_tlmm_ml: pinctrl@f100000 {
+				compatible = "qcom,sm8750-tlmm";
+				reg = <0xf100000 0x102000>;
+				interrupts = <GIC_SPI 208 IRQ_TYPE_LEVEL_HIGH>;
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+				/*
+				 * Secure pins, stock qcom,gpios-reserved =
+				 * <36 37 38 39 74 48 49 50 51>: never touched.
+				 * No wakeup-parent: touch interrupts use the
+				 * TLMM summary line, the PDC stays unused.
+				 */
+				gpio-reserved-ranges = <36 4>, <48 4>, <74 1>;
+
+				/*
+				 * MISO, MOSI, CLK, CS: stock qupv3_se2_spi_*_active
+				 * and mi_ts_spi_cs_active, mainline qup_spi2_*.
+				 */
+				piano_ts_spi_default: ts-spi-default-state {
+					pins = "gpio40", "gpio41", "gpio42", "gpio43";
+					function = "qup1_se2";
+					drive-strength = <6>;
+					bias-disable;
+				};
+			};
+		};
+	};
+
+	/*
+	 * The stock touch child (dtbo fragment@55/@138) follows three downstream
+	 * DSI panel nodes; that phandle keeps it waiting forever and cannot be
+	 * removed by an overlay.  Disable it and add a mainline-style child on
+	 * the same chip select.
+	 */
+	fragment@227 {
+		target = <&qupv3_se2_spi>;
+		__overlay__ {
+			novatek@0 {
+				status = "disabled";
+			};
+
+			touchscreen@0 {
+				compatible = "novatek,NVT-ts-spi";
+				reg = <0>;
+				spi-max-frequency = <19200000>;
+				/* stock: novatek,irq-gpio = <&tlmm 162 0x2001> */
+				novatek,irq-gpios = <&piano_tlmm_ml 162 0>;
+				/* stock: 0 = CSOT panel, 1 = BOE panel */
+				novatek,lcd-id-gpios = <&piano_tlmm_ml 100 0>;
+				firmware-name = "novatek/novatek_nt36532_piano_fw_csot.bin",
+						"novatek/novatek_nt36532_piano_fw_boe.bin";
+				status = "okay";
+			};
+		};
+	};
+
+	/*
+	 * Stock ramoops keeps only console and pmsg; trade pmsg (Android only)
+	 * for oops/panic records so crashes during bring-up leave a trace.
+	 */
+	fragment@228 {
+		target-path = "/reserved-memory/ramoops-region";
+		__overlay__ {
+			console-size = <0x200000>;
+			pmsg-size = <0>;
+			record-size = <0x40000>;
+		};
+	};
+};

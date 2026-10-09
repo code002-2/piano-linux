@@ -1,0 +1,80 @@
+#!/bin/sh
+# piano-bt-test — Bluetooth (peach combo, hci_qca on SE14 UART) check.
+#
+# Usage: piano-bt-test
+#
+# Stages reported:
+#   1. UART             — uart14 up, its tty present
+#   2. power sequencing — pwrseq-qcom-wcn bt target state
+#   3. controller       — /sys/class/bluetooth/hci0 (BD address proves
+#                         hci_qca firmware download succeeded:
+#                         qca/hmtbtfw20.tlv + qca/hmtnv20*)
+#
+# Read-only; no pairing/inquiry is performed.
+
+banner() {
+    echo
+    echo "=== piano Bluetooth test (peach / hci_qca) ==="
+}
+
+banner
+
+echo "--- uart14 / tty ---"
+if [ -d /sys/bus/serial-base/devices ] 2>/dev/null; then
+    found=0
+    for s in /sys/bus/serial-base/devices/*; do
+        [ -e "$s" ] || continue
+        case "$(readlink -f "$s")" in
+            *898000*) found=1; echo "  $(basename "$s") -> $(readlink -f "$s")" ;;
+        esac
+    done
+    [ "$found" = 1 ] || echo "  no serial-base device for uart14 (@898000)"
+fi
+for t in /sys/class/tty/ttyMSM*; do
+    [ -e "$t" ] || continue
+    echo "  tty: $(basename "$t")$(ls -l "$t/device/driver" 2>/dev/null | sed 's|.*/| (|;s|$|)|')"
+done
+
+echo
+echo "--- power sequencing ---"
+for p in /sys/class/pwrseq/*; do
+    [ -e "$p" ] || continue
+    echo "  $(basename "$p")"
+    ls "$p" 2>/dev/null | sed 's/^/    /'
+done
+dmesg 2>/dev/null | grep -i 'pwrseq' | tail -5
+
+echo
+echo "--- hci controller ---"
+if [ -e /sys/class/bluetooth/hci0 ]; then
+    echo "  hci0 UP, address $(cat /sys/class/bluetooth/hci0/address 2>/dev/null)"
+    for f in /sys/class/bluetooth/hci0/*; do
+        case "$(basename "$f")" in
+            address|uevent|power|subsystem|dev) ;;
+            *) [ -r "$f" ] && [ ! -d "$f" ] && echo "    $(basename "$f") = $(cat "$f" 2>/dev/null)" ;;
+        esac
+    done
+    if dmesg 2>/dev/null | grep 'Bluetooth: hci0:' | tail -1 | grep -qiE 'fail|retry|timeout|error'; then
+        echo "  => hci0 registered, but the QCA setup failed (see dmesg below)"
+    else
+        echo "  => controller alive: QCA firmware download completed"
+    fi
+else
+    echo "  no hci0 — controller did not come up"
+fi
+
+rfkill list 2>/dev/null || true
+
+echo
+echo "--- loaded modules ---"
+lsmod | grep -E 'hci_uart|btqca|bluetooth|rfkill|pwrseq' || echo "  none loaded"
+
+echo
+echo "--- dmesg (bluetooth/qca/uart) ---"
+dmesg 2>/dev/null | grep -iE 'bluetooth|hci|qca|uart|serial' | tail -30
+
+echo
+echo "--- hints ---"
+echo "  no hci0       : check bt-en (pm8550ve_f gpio3), 38.4M rf clock, qca/ fw files"
+echo "  fw -2         : dmesg names the missing file (hmtbtfw20.tlv / hmtnv20*)"
+echo "  pairing tools : not shipped (detection-level test image)"

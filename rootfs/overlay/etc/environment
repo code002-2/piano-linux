@@ -1,0 +1,15 @@
+# Piano: piano-mesa drives the Adreno 830 under freedreno (validated on
+# device: GNOME on msm-kms 3200x2136@144). The llvmpipe forcing from the
+# pre-GPU era is retired: forced llvmpipe-on-GBM crashes mutter in its
+# first frame on the msm card (gnome-shell SEGV loop). Do not re-enable.
+#LIBGL_ALWAYS_SOFTWARE=1
+#GALLIUM_DRIVER=llvmpipe
+LANG=zh_CN.UTF-8
+LANGUAGE=zh_CN:zh
+LC_MESSAGES=zh_CN.UTF-8
+LC_TIME=zh_CN.UTF-8
+LC_NUMERIC=en_US.UTF-8
+LC_MONETARY=en_US.UTF-8
+GTK_IM_MODULE=ibus
+QT_IM_MODULE=ibus
+XMODIFIERS=@im=ibus

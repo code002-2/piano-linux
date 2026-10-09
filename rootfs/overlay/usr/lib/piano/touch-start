@@ -1,0 +1,33 @@
+#!/bin/sh
+set -eu
+[ -f /run/piano-smmu-ready ] || { echo 'SMMU initialization missing'; exit 1; }
+modprobe gpio_shared_proxy
+modprobe pwrseq_qcom_wcn
+modprobe pinctrl_sm8750
+modprobe gpi
+modprobe spi_geni_qcom
+modprobe nt36532e_ts
+modprobe uinput
+D=/sys/bus/spi/drivers/NVT-ts-spi
+DEV=''
+for d in "$D"/spi*; do
+    [ -e "$d" ] || continue
+    DEV=${d##*/}
+    break
+done
+if [ -n "$DEV" ]; then
+    # The panel takeover (piano-display stage 5) resets the TDDI touch IC
+    # and wedges its THP stream: passive capture stays silent and the
+    # reference capture never completes. Only a full driver rebind (IC
+    # reset + firmware redownload) restores frames under the live DSC
+    # display. Safe on first bind and without native display as well.
+    echo "$DEV" > "$D/unbind"
+    sleep 1
+    echo "$DEV" > "$D/bind"
+    sleep 2
+fi
+n=0
+until grep -q '^irq_enabled: 1' /proc/nvt_thp_status 2>/dev/null; do
+    [ "$n" -lt 30 ] || exit 1
+    sleep 1; n=$((n + 1))
+done

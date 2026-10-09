@@ -1,0 +1,6 @@
+kernel/
+firmware/
+out/
+local/
+refer/
+*.raw.img

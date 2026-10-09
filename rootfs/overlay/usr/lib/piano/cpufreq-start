@@ -1,0 +1,40 @@
+#!/bin/sh
+# cpufreq-start: enable the CPU boost frequencies (piano-cpufreq service).
+#
+# scmi-cpufreq lists the top two steps of the prime cores (4.2048 and
+# 4.32 GHz) as boost frequencies and starts with boost off, which caps
+# cpu6-7 at 4.0896 GHz.  Stock Android runs them up to 4.32 GHz; the stock
+# CPU thermal zones (95 degC passive trips on the cpufreq cooling devices)
+# and the CPUCP's own limits still apply.
+#
+# The policies appear once qcom_cpucp_mbox (modules-load.d) binds and
+# scmi-cpufreq probes, so wait for them first.
+# /etc/piano/cpufreq.conf may set CPU_BOOST=0 to leave boost off.
+set -eu
+
+CPU_BOOST=1
+# shellcheck source=/dev/null
+[ ! -r /etc/piano/cpufreq.conf ] || . /etc/piano/cpufreq.conf
+
+CPUFREQ=/sys/devices/system/cpu/cpufreq
+
+say() {
+    echo "piano-cpufreq: $*"
+    echo "piano-cpufreq: $*" > /dev/kmsg 2>/dev/null || true
+}
+
+die() {
+    say "FAIL: $*"
+    exit 1
+}
+
+[ "$CPU_BOOST" = 1 ] || { say "boost left off by /etc/piano/cpufreq.conf"; exit 0; }
+
+n=0
+until [ -e "$CPUFREQ/policy6" ] && [ -e "$CPUFREQ/boost" ]; do
+    [ "$n" -lt 200 ] || die 'no cpufreq policy for the prime cores'
+    sleep 0.1; n=$((n + 1))
+done
+
+echo 1 > "$CPUFREQ/boost" || die 'cannot enable boost'
+say "DONE boost=$(cat "$CPUFREQ/boost") cpu6-7 max $(cat "$CPUFREQ/policy6/scaling_max_freq") kHz"

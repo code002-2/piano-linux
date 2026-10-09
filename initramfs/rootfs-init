@@ -1,0 +1,137 @@
+#!/bin/sh
+# Independent entry point: ABL appends Android's /init after our embedded cpio.
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+/bin/busybox --install -s /bin
+mkdir -p /dev /proc /sys /run /sysroot /tmp
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts /dev/shm
+mount -t devpts devpts /dev/pts
+mount -t tmpfs tmpfs /dev/shm
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t tmpfs -o mode=0755 tmpfs /run
+log() {
+    echo "piano: $*" | tee -a /run/piano-boot.log
+    # Level 3 so the steps show on the console: cold boots have no USB/SSH.
+    [ ! -c /dev/kmsg ] || echo "<3>piano: $*" > /dev/kmsg
+}
+start_ssh() {
+    [ ! -s /run/piano-dropbear.pid ] || return 0
+    mkdir -p /etc/dropbear
+    [ -s /etc/dropbear/dropbear_ed25519_host_key ] ||
+        dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key || return 1
+    dropbear -s -j -k -E -p 10.42.0.2:22 -P /run/piano-dropbear.pid \
+        2>> /run/piano-dropbear.log
+}
+rescue() {
+    log "RESCUE: $*"
+    echo "$*" > /run/rootfs-error
+    log 'Rescue: ssh -i access-key root@10.42.0.2 (host 10.42.0.1/24). No telnet/password login.'
+    while :; do setsid cttyhack /bin/sh; sleep 1; done
+}
+# A PHY module alone did not prevent the built-in host's early probe.
+# Both UFS drivers are now modules, and no register access precedes NCM.
+log 'INIT: starting USB NCM before storage initialization'
+# On a cold boot from boot_b, ABL leaves USB unpowered and dwc3 fails its
+# soft reset; only fastboot RAM boots inherit a working controller. The
+# debug network is therefore best effort and never blocks the Debian boot.
+# dwc3 is built in and has already probed: when it failed (cold boot) skip
+# the 120 s wait for a device controller that will never appear.
+if [ -e /sys/bus/platform/drivers/dwc3-qcom/a600000.ssusb ] &&
+   /usr/lib/piano/usb-network > /run/piano-usb.log 2>&1 && start_ssh; then
+    log 'NCM_READY: key-only root SSH at 10.42.0.2; UFS drivers still unloaded'
+else
+    log 'WARN: USB NCM/SSH unavailable (see /run/piano-usb.log); continuing without it'
+fi
+diagnostic=0
+[ ! -f /etc/piano/diagnostic ] || diagnostic=1
+step() {
+    if [ "$diagnostic" = 1 ]; then
+        log "WAIT $1: stream /dev/kmsg to the host, then touch /run/piano-next to continue"
+        while [ ! -e /run/piano-next ]; do sleep 1; done
+        rm /run/piano-next
+    fi
+    log "BEGIN $1"
+}
+step smmu
+piano-qup-smmu 0xb6 0xa3 0x1400/0x7f 0x436 0x423 0x60 > /run/qup-smmu.log 2>&1 \
+    || rescue 'SMMU repair failed; DMA drivers remain unloaded'
+# ADSP DMA streams, exactly the stock iommus values (audio-ion, then the
+# fastrpc compute contexts).  The hypervisor rejects wide masks (0x15, 0xff:
+# bus error on the SMR write) but takes these; slots beyond 10 are fine.
+# Non-fatal: without them only audio and sensors would fault.
+piano-qup-smmu 0x1001/0x80 0x1041/0x20 \
+    0x1003/0x80 0x1043/0x20 0x1004/0x80 0x1044/0x20 0x1005/0x80 0x1045/0x20 \
+    0x1006/0x80 0x1046/0x20 0x1007/0x40 0x1067 0x1087 0x1008/0x80 0x1048/0x20 \
+    >> /run/qup-smmu.log 2>&1 \
+    || log 'WARN ADSP SMMU stream matches failed (see /run/qup-smmu.log)'
+touch /run/piano-smmu-ready
+log 'DONE smmu'
+step ufs-clkref
+# Stock TCSR base 0x0f204008 + upstream UFS CLKREF offset 0x1000.
+# This access is not device-validated. Do not scan neighboring registers.
+v=$(devmem 0x0f205008 32) || rescue 'cannot read UFS reference clock'
+devmem 0x0f205008 32 "$((v | 1))" || rescue 'cannot enable UFS reference clock'
+log 'DONE ufs-clkref'
+step ufs-phy
+modprobe phy_qcom_qmp_ufs || rescue 'UFS PHY module failed'
+log 'DONE ufs-phy'
+step ufs-host
+modprobe ufs_qcom || rescue 'UFS host module failed'
+log 'DONE ufs-host (module loaded; device probe may still be deferred)'
+root=
+# Kernel command-line tokens are whitespace-separated, not lines.
+# shellcheck disable=SC2013
+for arg in $(cat /proc/cmdline); do
+    case "$arg" in root=*) root=${arg#root=} ;; esac
+done
+[ "$root" = PARTLABEL=userdata ] || rescue "unsupported root=$root (expected PARTLABEL=userdata)"
+# No udev in early boot: the GPT PARTNAME in sysfs identifies userdata.
+n=0; device=
+while [ "$n" -lt 90 ]; do
+    matches=0
+    for part in /sys/class/block/*; do
+        [ -f "$part/partition" ] || continue
+        if grep -qx 'PARTNAME=userdata' "$part/uevent"; then
+            device=/dev/${part##*/}; matches=$((matches + 1))
+        fi
+    done
+    [ "$matches" -le 1 ] || rescue 'ambiguous userdata partition'
+    [ "$matches" -ne 1 ] || break
+    sleep 1; n=$((n + 1))
+done
+[ -b "$device" ] || rescue 'userdata did not appear within 90 seconds'
+step mount-root
+# Read-only handoff allows systemd-fsck-root to check before remounting rw.
+mount_options=ro
+[ "$diagnostic" = 0 ] || mount_options=ro,noload
+mount -t ext4 -o "$mount_options" "$device" /sysroot || rescue 'userdata is not mountable ext4'
+# Diagnostic boots never replay the journal or start a writable Debian system.
+if [ "$diagnostic" = 1 ]; then
+    log 'DIAGNOSTIC COMPLETE: userdata mounted ro,noload at /sysroot; Debian handoff disabled'
+    while :; do sleep 3600; done
+fi
+# Resolve init and the ELF loader inside Debian, not against the initramfs.
+chroot /sysroot /usr/bin/test -x /sbin/init || rescue 'rootfs cannot execute /sbin/init'
+release=$(uname -r)
+# The rootfs only has to carry this kernel's modules; a stale release stamp
+# is reported but no longer blocks the handoff, so a rebuilt kernel can boot
+# an existing userdata after its module tree has been installed.
+[ "$(cat /sysroot/etc/piano/kernel-release 2>/dev/null)" = "$release" ] \
+    || log "WARN: /etc/piano/kernel-release does not match $release"
+[ -d "/sysroot/lib/modules/$release" ] || rescue 'rootfs lacks matching kernel modules'
+log 'DONE mount-root (matching Debian init and kernel release found)'
+step switch-root
+# Leave the gadget/address configured for piano-usb.service, but release
+# the initramfs SSH listener before Debian sshd starts on the same port.
+if [ -s /run/piano-dropbear.pid ]; then
+    kill "$(cat /run/piano-dropbear.pid)" || rescue 'cannot stop initramfs SSH'
+    rm /run/piano-dropbear.pid
+fi
+for dir in dev proc sys run; do
+    [ -d "/sysroot/$dir" ] || rescue "missing rootfs /$dir"
+done
+for dir in dev proc sys run; do
+    mount --move "/$dir" "/sysroot/$dir" || rescue "cannot move /$dir"
+done
+exec switch_root /sysroot /sbin/init

@@ -1,0 +1,140 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* Keyboard profile: the keyboard cover behind the pogo pins.
+ *
+ * A Nanosic WN8030 MCU at 0x4c on QUP1 SE6 bridges the cover's keyboard
+ * and touchpad.  It boots from RAM: its bootloader takes the stock
+ * MCU_Upgrade.bin over I2C at every power-up.  The stock dtbo fragment for
+ * the same node stays in place; everything the mainline driver reads is
+ * re-stated below.
+ *
+ *   - dvdd, 3.3 V: stock L14B, which feeds nothing but this MCU and is off
+ *     until HLOS enables it (no proxy vote).  The stock kernel votes
+ *     3300 mV; the mainline LDO step rounds that up to 3304 mV, and AOP
+ *     resets the SoC as soon as that vote is enabled.  3296 mV, the step
+ *     below, is safe.
+ *   - vddio, 1.8 V: stock L11B, which also feeds the panel and the I2C
+ *     pull-ups and is left on by the bootloader.  Declared always-on so no
+ *     consumer can ever switch it off; the driver enables it before L14B,
+ *     because the MCU must never see 3.3 V without its I/O rail.
+ *   - Both are the only regulators of a mainline PM8550 block.
+ *   - The SE runs at 1 MHz, as on stock, on GPI DMA (the QUP1 GPI streams
+ *     are already matched for the touchscreen SPI).
+ *   - Pins as in the stock nanosic_keyboard_mcu / mi_qupv3_se6_i2c states.
+ *
+ * Nothing loads the keyboard driver on coldplug (of: modaliases are not
+ * autoloaded); the piano-keyboard service does, after the touchscreen
+ * service has brought up the QUP1 GPI controller.
+ */
+#include "dtbo-piano-video.dts"
+#include <dt-bindings/clock/qcom,sm8750-gcc.h>
+#include <dt-bindings/dma/qcom-gpi.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interconnect/qcom,icc.h>
+#include <dt-bindings/interconnect/qcom,sm8750-rpmh.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/regulator/qcom,rpmh-regulator.h>
+
+/ {
+	fragment@320 {
+		target = <&apps_rsc>;
+		__overlay__ {
+			kbd_regs_b: regulators-4 {
+				compatible = "qcom,pm8550-rpmh-regulators";
+				qcom,pmic-id = "b";
+
+				vreg_l11b_1p8_ml: ldo11 {
+					regulator-name = "vreg_l11b_1p8_ml";
+					regulator-min-microvolt = <1800000>;
+					regulator-max-microvolt = <1800000>;
+					regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+					regulator-always-on;
+					regulator-boot-on;
+				};
+
+				vreg_l14b_3p3_ml: ldo14 {
+					regulator-name = "vreg_l14b_3p3_ml";
+					/* never 3304 mV: see above */
+					regulator-min-microvolt = <3296000>;
+					regulator-max-microvolt = <3296000>;
+					regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+				};
+			};
+		};
+	};
+
+	fragment@321 {
+		target-path = "/soc";
+		__overlay__ {
+			pinctrl@f100000 {
+				kbd_i2c6_ml: kbd-i2c6-state {
+					pins = "gpio56", "gpio57";
+					function = "qup1_se6";
+					drive-strength = <2>;
+					bias-disable;
+				};
+
+				kbd_mcu_ml: kbd-mcu-state {
+					sleep-pins {
+						pins = "gpio3";
+						function = "gpio";
+						drive-strength = <2>;
+						bias-pull-down;
+					};
+
+					reset-status-pins {
+						pins = "gpio188", "gpio95";
+						function = "gpio";
+						drive-strength = <2>;
+						bias-disable;
+					};
+				};
+			};
+		};
+	};
+
+	fragment@322 {
+		target = <&qupv3_se6_i2c>;
+		__overlay__ {
+			compatible = "qcom,geni-i2c";
+			clocks = <&gcc GCC_QUPV3_WRAP1_S6_CLK>;
+			clock-names = "se";
+			interconnects = <&clk_virt MASTER_QUP_CORE_1 QCOM_ICC_TAG_ALWAYS
+					 &clk_virt SLAVE_QUP_CORE_1 QCOM_ICC_TAG_ALWAYS>,
+					<&gem_noc MASTER_APPSS_PROC QCOM_ICC_TAG_ALWAYS
+					 &config_noc SLAVE_QUP_1 QCOM_ICC_TAG_ALWAYS>,
+					<&aggre1_noc MASTER_QUP_1 QCOM_ICC_TAG_ALWAYS
+					 &mc_virt SLAVE_EBI1 QCOM_ICC_TAG_ALWAYS>;
+			interconnect-names = "qup-core", "qup-config", "qup-memory";
+			dmas = <&gpi_dma1 0 6 QCOM_GPI_I2C>,
+			       <&gpi_dma1 1 6 QCOM_GPI_I2C>;
+			dma-names = "tx", "rx";
+			pinctrl-names = "default", "sleep";
+			pinctrl-0 = <&kbd_i2c6_ml>;
+			/* The stock "sleep" state is in the driverless stock TLMM. */
+			pinctrl-1 = <&kbd_i2c6_ml>;
+			clock-frequency = <1000000>;
+			status = "okay";
+
+			nanosic@4c {
+				compatible = "nanosic,wn8030-piano";
+				pinctrl-names = "default";
+				pinctrl-0 = <&kbd_mcu_ml>;
+
+				interrupts-extended = <&piano_tlmm_ml 97 IRQ_TYPE_EDGE_RISING>;
+
+				reset-gpios = <&piano_tlmm_ml 188 GPIO_ACTIVE_LOW>;
+				sleep-gpios = <&piano_tlmm_ml 3 GPIO_ACTIVE_LOW>;
+				status-gpios = <&piano_tlmm_ml 95 GPIO_ACTIVE_HIGH>;
+
+				vddio-supply = <&vreg_l11b_1p8_ml>;
+				dvdd-supply = <&vreg_l14b_3p3_ml>;
+				/*
+				 * The stock fragment names L14B "vdd" and points it at
+				 * the driverless stock regulator, which fw_devlink would
+				 * wait on; the driver never requests it.
+				 */
+				vdd-supply = <&vreg_l14b_3p3_ml>;
+			};
+		};
+	};
+};

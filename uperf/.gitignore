@@ -1,0 +1,50 @@
+# CMake build directories
+/build/
+/build-*/
+/cmake-build-*/
+
+# CMake, CTest, CPack, and Ninja generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+CPackConfig.cmake
+CPackSourceConfig.cmake
+Testing/
+compile_commands.json
+build.ninja
+.ninja_deps
+.ninja_log
+
+# Compiled binaries and libraries
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+
+# Packages and coverage output
+*.deb
+*.rpm
+*.gcda
+*.gcno
+*.gcov
+/coverage/
+
+# Logs and crash dumps
+*.log
+core
+core.*
+
+# Editors and operating systems
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

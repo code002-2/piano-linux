@@ -1,0 +1,243 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""Android-style power button and keyboard-cover switch for the piano session.
+
+Short press of the power key toggles the panel backlight; holding the key
+for LONG_PRESS seconds opens the GNOME power-off/restart dialog.  The key
+is grabbed (EVIOCGRAB) so neither logind nor gnome-settings-daemon acts on
+it: gsd powers the system off on every press because systemd detects the
+hypervisor and reports the chassis as "vm".
+
+Closing the official keyboard cover over the screen (the lid hall switch,
+gpio80 behind gpio-keys) turns the backlight off; opening it restores the
+previous level.  Neither logind nor GNOME suspends on lid or idle
+(HandleLidSwitch*=ignore, idle-delay=0), so this service owns that too:
+SUSPEND_AFTER seconds after the screen went dark (cover closed or short
+press), it runs `systemctl suspend` — s2idle, per the kernel command line.
+Any wake-up (key press, cover open) cancels the suspend, and after a
+resume with the cover still closed it arms again.  SUSPEND_AFTER=0 in
+/etc/piano/screen.conf disables the suspend entirely; the lid device is
+optional — its absence never blocks the power key.
+
+The screen is "turned off" through the backlight only.  A real DPMS off
+of the native display leaves the DSI host erroring on re-enable, so the
+scanout keeps running underneath; s2idle takes the whole display down
+with the power domains instead.
+"""
+import fcntl
+import glob
+import os
+import select
+import struct
+import subprocess
+import sys
+import time
+
+KEY_NAME = "pmic_pwrkey"
+LID_NAMES = ("hall_lid", "soc:piano-hall-ml")
+CONF_PATH = "/etc/piano/screen.conf"
+DEFAULT_SUSPEND_AFTER = 30
+KEY_POWER = 116
+EV_KEY = 1
+EV_SW = 5
+SW_LID = 0
+LONG_PRESS = 0.8
+EVIOCGRAB = 0x40044590
+# _IOC(_IOC_READ, 'E', 0x1b, 4): the switch state bitmap
+EVIOCGSW = (2 << 30) | (4 << 16) | (0x45 << 8) | 0x1B
+EVENT = struct.Struct("llHHi")
+
+
+def log(msg):
+    print(f"power-button: {msg}", file=sys.stderr, flush=True)
+
+
+def find_device(names):
+    for path in glob.glob("/sys/class/input/event*/device/name"):
+        with open(path) as f:
+            if f.read().strip() in names:
+                return "/dev/input/" + path.split("/")[4]
+    return None
+
+
+def suspend_after():
+    """Seconds of dark screen before suspend; 0 disables."""
+    try:
+        with open(CONF_PATH) as f:
+            for line in f:
+                key, _, value = line.partition("=")
+                if key.strip() == "SUSPEND_AFTER":
+                    return max(0, int(value.strip() or 0))
+    except (OSError, ValueError):
+        pass
+    return DEFAULT_SUSPEND_AFTER
+
+
+def find_backlight():
+    names = sorted(os.listdir("/sys/class/backlight"))
+    return names[0] if names else None
+
+
+def brightness(bl):
+    with open(f"/sys/class/backlight/{bl}/brightness") as f:
+        return int(f.read())
+
+
+def set_brightness(bl, value):
+    subprocess.run(
+        ["gdbus", "call", "--system", "--dest", "org.freedesktop.login1",
+         "--object-path", "/org/freedesktop/login1/session/auto",
+         "--method", "org.freedesktop.login1.Session.SetBrightness",
+         "backlight", bl, str(value)],
+        stdout=subprocess.DEVNULL, check=False)
+
+
+def power_dialog():
+    subprocess.run(
+        ["gdbus", "call", "--session", "--dest", "org.gnome.SessionManager",
+         "--object-path", "/org/gnome/SessionManager",
+         "--method", "org.gnome.SessionManager.Shutdown"],
+        stdout=subprocess.DEVNULL, check=False)
+
+
+def lid_closed(fd):
+    sw = bytearray(4)
+    try:
+        fcntl.ioctl(fd, EVIOCGSW, sw, True)
+        return bool(sw[0] & (1 << SW_LID))
+    except OSError:
+        return False
+
+
+class Screen:
+    """Backlight on/off with one remembered level, plus the suspend timer."""
+
+    def __init__(self):
+        self.saved = None
+        self.lidfd = None
+        self.suspend_at = None
+
+    def off(self):
+        bl = find_backlight()
+        if bl is None:
+            return
+        if self.saved is None:
+            self.saved = brightness(bl) or 1
+            set_brightness(bl, 0)
+        self.arm_suspend()
+
+    def toggle(self):
+        bl = find_backlight()
+        if bl is None:
+            return
+        if self.saved is None:
+            self.off()
+        else:
+            self.wake()
+
+    def wake(self):
+        bl = find_backlight()
+        if bl is not None and self.saved is not None:
+            set_brightness(bl, self.saved)
+        self.saved = None
+        self.suspend_at = None
+
+    def arm_suspend(self):
+        seconds = suspend_after()
+        if seconds > 0:
+            self.suspend_at = time.monotonic() + seconds
+        else:
+            self.suspend_at = None
+
+    def suspend_due(self):
+        """Suspend if the dark timeout has passed; blocks through resume."""
+        if self.suspend_at is None or self.saved is None:
+            self.suspend_at = None
+            return False
+        if time.monotonic() < self.suspend_at:
+            return False
+        self.suspend_at = None
+        log("dark for %d s: suspending (s2idle)" % suspend_after())
+        subprocess.run(["systemctl", "suspend"],
+                       stdout=subprocess.DEVNULL, check=False)
+        # Resumed.  With the cover still closed, go dark and arm again;
+        # the level was already saved while the screen was off.
+        if self.lidfd is not None and lid_closed(self.lidfd):
+            bl = find_backlight()
+            if bl is not None and self.saved is not None:
+                set_brightness(bl, 0)
+            self.arm_suspend()
+            log("resumed with the cover closed: armed again")
+        else:
+            log("resumed")
+        return True
+
+
+def open_key():
+    dev = None
+    while dev is None:
+        dev = find_device((KEY_NAME,))
+        if dev is None:
+            time.sleep(2)
+    return dev, os.open(dev, os.O_RDONLY)
+
+
+def main():
+    keydev, keyfd = open_key()
+    try:
+        fcntl.ioctl(keyfd, EVIOCGRAB, 1)
+    except OSError as e:
+        log(f"cannot grab {keydev}: {e}")
+
+    screen = Screen()
+    lidfd, liddev = None, None
+    pressed_at = None
+    while True:
+        fds = [keyfd]
+        if lidfd is not None:
+            fds.append(lidfd)
+        timeout = None
+        if pressed_at is not None:
+            timeout = max(0.0, pressed_at + LONG_PRESS - time.monotonic())
+        if screen.suspend_at is not None:
+            until = max(0.0, screen.suspend_at - time.monotonic())
+            timeout = until if timeout is None else min(timeout, until)
+        if lidfd is None:
+            # Keep the power key alive while the lid device is missing.
+            timeout = 2.0 if timeout is None else min(timeout, 2.0)
+        ready, _, _ = select.select(fds, [], [], timeout)
+        for fd in ready:
+            data = os.read(fd, EVENT.size * 64)
+            for off in range(0, len(data) - EVENT.size + 1, EVENT.size):
+                _, _, etype, code, value = EVENT.unpack_from(data, off)
+                if fd == keyfd and (etype, code) == (EV_KEY, KEY_POWER):
+                    if value == 1:
+                        pressed_at = time.monotonic()
+                    elif value == 0 and pressed_at is not None:
+                        pressed_at = None
+                        screen.toggle()
+                elif fd == lidfd and (etype, code) == (EV_SW, SW_LID):
+                    if value:
+                        screen.off()
+                    else:
+                        screen.wake()
+        if not ready and pressed_at is not None:
+            # Held long enough: show the dialog without waiting for release.
+            pressed_at = None
+            screen.wake()
+            power_dialog()
+            continue
+        if lidfd is None:
+            liddev = find_device(LID_NAMES)
+            if liddev is not None:
+                lidfd = os.open(liddev, os.O_RDONLY)
+                screen.lidfd = lidfd
+                if lid_closed(lidfd):
+                    screen.off()
+                log(f"watching the lid switch on {liddev}")
+        if screen.suspend_due():
+            continue  # re-evaluate timeouts after the resume
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,115 @@
+#!/bin/sh
+# piano-battery-test — battery / charging telemetry via ADSP + pmic-glink.
+#
+# Success ladder (each step narrows the fault domain):
+#   1. ADSP remoteproc online      — firmware loaded and running
+#   2. pmic-glink bound            — glink channel to the ADSP up
+#   3. qcom-battmgr power supplies — battery service answering
+#   4. live telemetry table        — capacity/voltage/current/temperature
+#   5. USB supply online           — charger input visible
+#
+# Usage: piano-battery-test [--watch N]   sample telemetry every 2 s for N s
+
+WATCH=0
+[ "${1-}" = "--watch" ] && WATCH=${2:-20}
+
+rproc=/sys/class/remoteproc
+psy=/sys/class/power_supply
+pass=0; fail=0; skip=0
+
+ok()   { printf '  [ OK ] %s\n' "$*"; pass=$((pass + 1)); }
+bad()  { printf '  [FAIL] %s\n' "$*"; fail=$((fail + 1)); }
+skip() { printf '  [SKIP] %s\n' "$*"; skip=$((skip + 1)); }
+
+printf '== piano battery test ==\n'
+
+# 1. remoteproc states ------------------------------------------------------
+adsp_state=""
+cdsp_state=""
+for r in "$rproc"/remoteproc*; do
+    [ -d "$r" ] || continue
+    name=$(cat "$r/name" 2>/dev/null)
+    state=$(cat "$r/state" 2>/dev/null)
+    case "$name" in
+        *adsp*) adsp_state=$state ;;
+        *cdsp*) cdsp_state=$state ;;
+    esac
+done
+[ -n "$adsp_state" ] || skip "no ADSP remoteproc node (DTS / qcom_q6v5_pas)"
+if [ "$adsp_state" = "running" ]; then
+    ok "ADSP remoteproc running"
+else
+    bad "ADSP state: ${adsp_state:-absent} (firmware load failed? dmesg | grep -i 'adsp\|remoteproc')"
+fi
+if [ "$cdsp_state" = "running" ]; then
+    ok "CDSP remoteproc running"
+elif [ -n "$cdsp_state" ]; then
+    bad "CDSP state: $cdsp_state"
+else
+    skip "no CDSP remoteproc node"
+fi
+
+# 2. pmic-glink -------------------------------------------------------------
+if dmesg | grep -qE 'pmic.?glink.*(registered|client)'; then
+    ok "pmic-glink active (dmesg)"
+elif dmesg | grep -q 'pmic_glink'; then
+    ok "pmic-glink present (dmesg, probe state below)"
+else
+    bad "no pmic-glink in dmesg (modprobe pmic_glink; is ADSP up?)"
+fi
+
+# 3. battmgr power supplies --------------------------------------------------
+bat=$psy/qcom-battmgr-bat
+usb=$psy/qcom-battmgr-usb
+[ -d "$bat" ] && ok "battery supply registered (qcom-battmgr-bat)" \
+              || bad "no qcom-battmgr-bat (ADSP battery service not answering)"
+[ -d "$usb" ] && ok "USB supply registered (qcom-battmgr-usb)" \
+              || skip "no qcom-battmgr-usb (cable unplugged is fine)"
+
+# 4. telemetry ---------------------------------------------------------------
+readf() { cat "$1" 2>/dev/null; }
+if [ -d "$bat" ]; then
+    cap=$(readf "$bat/capacity")
+    volt=$(readf "$bat/voltage_now")
+    curr=$(readf "$bat/current_now")
+    temp=$(readf "$bat/temp")
+    stat=$(readf "$bat/status")
+    health=$(readf "$bat/health")
+    if [ -n "$cap" ] && [ "$cap" != "0" ]; then
+        ok "telemetry live"
+        printf '       capacity=%s%%  status=%s  health=%s\n' "$cap" "$stat" "$health"
+        [ -n "$volt" ] && [ "$volt" != "0" ] \
+            && printf '       voltage=%s uV  current=%s uA  temp=%s (0.1 degC)\n' "$volt" "$curr" "$temp" \
+            || bad "telemetry reads zero (ADSP service half-up; see dmesg)"
+        [ -n "$WATCH" ] && [ "$WATCH" != "0" ] && [ "$WATCH" -gt 0 ] 2>/dev/null && {
+            printf '  -- sampling every 2 s for %s s (capacity voltage current temp) --\n' "$WATCH"
+            end=$(( $(date +%s) + WATCH ))
+            while [ "$(date +%s)" -lt "$end" ]; do
+                sleep 2
+                printf '       %s%% %s uV %s uA %s\n' \
+                    "$(readf "$bat/capacity")" "$(readf "$bat/voltage_now")" \
+                    "$(readf "$bat/current_now")" "$(readf "$bat/temp")"
+            done
+        }
+    else
+        bad "battery capacity reads empty/0 (first ADSP sync may take ~10 s; retry)"
+    fi
+else
+    skip "telemetry skipped (no battery supply)"
+fi
+
+# 5. charger input ------------------------------------------------------------
+if [ -d "$usb" ]; then
+    online=$(readf "$usb/online")
+    if [ "$online" = "1" ]; then
+        ok "USB charger online: $(readf "$usb/voltage_now") uV / $(readf "$usb/current_now") uA max"
+    else
+        skip "USB supply offline (unplugged — plug in to test charging path)"
+    fi
+fi
+
+# evidence pointers -----------------------------------------------------------
+printf -- '--- evidence: dmesg | grep -iE "battmgr|pmic.glink|adsp" ; ls -l %s\n' "$psy"
+
+printf '== result: %d ok, %d fail, %d skip ==\n' "$pass" "$fail" "$skip"
+[ "$fail" -eq 0 ]

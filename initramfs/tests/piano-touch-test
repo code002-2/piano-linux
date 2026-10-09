@@ -1,0 +1,277 @@
+#!/bin/sh
+# piano-touch-test — staged bring-up of the NT36532 THP touch path.
+#
+# Usage: piano-touch-test [--stage N | --upto N] [--view MODE] [--seconds N]
+#
+# Stages (default: 0..4, stop at the first failure):
+#   0  preflight, read only: DT nodes, TLMM pin state (devmem, bounded),
+#      pstore of the previous boot, device tree copy in /run/fdt.dtb
+#   1  load pinctrl-sm8750 (mainline TLMM at 0xf100000, secure GPIOs
+#      excluded by gpio-reserved-ranges)
+#   2  make sure the QUP1 GPI/SE streams are matched in the apps SMMU
+#      (piano-qup-smmu, also run by init; without them the first SPI DMA
+#      resets the SoC), load gpi + spi-geni-qcom, check that GPIO40-43
+#      moved to qup1_se2
+#   3  load nt36532e_ts: chip ID, panel ID, firmware download, IRQ
+#   4  touch test on screen and console (piano-touch-view MODE, default
+#      paint for 30 s: finger traces on the panel, down/move/up lines
+#      here; three fingers or "c" + Enter clear, "q" + Enter stops; the
+#      console picture comes back at the end)
+#   5  (only on request) start the uinput touchscreen in the background:
+#      a multitouch /dev/input/event* until reboot
+#
+# Every stage start is written to /dev/kmsg, so after a hard reset the
+# pstore console of the next boot shows how far this got. Output is also
+# kept in /run/touch-test.log (http://10.42.0.2:8080/touch-test.log).
+#
+# Exit code: number of the failed stage + 10, 0 when all requested stages
+# passed, 2 on usage errors.
+
+FIRST=0
+LAST=4
+VIEW=paint
+VIEW_SECONDS=30
+
+LOG=/run/touch-test.log
+
+# Mirror everything into $LOG (busybox ash: no process substitution); this
+# must run before the arguments are shifted away.
+if [ -z "${PIANO_TOUCH_TEST_LOGGED-}" ]; then
+    { PIANO_TOUCH_TEST_LOGGED=1 "$0" "$@" 2>&1; echo $? > /run/touch-test.rc; } \
+        | tee -a "$LOG"
+    exit "$(cat /run/touch-test.rc)"
+fi
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --stage)   FIRST=${2-}; LAST=${2-}; shift 2 ;;
+        --upto)    LAST=${2-}; shift 2 ;;
+        --view)    VIEW=${2-}; shift 2 ;;
+        --seconds) VIEW_SECONDS=${2-}; shift 2 ;;
+        -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
+        *) echo "piano-touch-test: unknown option: $1" >&2; exit 2 ;;
+    esac
+done
+for n in "$FIRST" "$LAST" "$VIEW_SECONDS"; do
+    case "$n" in ''|*[!0-9]*) echo "piano-touch-test: numeric argument expected" >&2; exit 2 ;; esac
+done
+
+KVER=$(uname -r)
+DT=/proc/device-tree
+SPI_DT=$DT/soc/qcom,qupv3_1_geni_se@ac0000/spi@a88000
+TLMM_DEV=/sys/bus/platform/devices/f100000.pinctrl
+SPI_DEV=/sys/bus/platform/devices/a88000.spi
+
+# TLMM pin registers: 0xf100000 + 0x1000 * pin (ctl), +4 (io). Reading past
+# 0xf202000 resets the SoC; the secure pins must never be read at all.
+TLMM_BASE=$((0x0f100000))
+TLMM_END=$((0x0f202000))
+RESERVED=" 36 37 38 39 48 49 50 51 74 "
+
+
+say() { echo "== $*"; echo "piano-touch-test: $*" > /dev/kmsg 2>/dev/null; }
+fail() { echo "FAIL: $*"; echo "piano-touch-test: FAIL $*" > /dev/kmsg 2>/dev/null; exit $((10 + STAGE)); }
+pass() { echo "PASS: stage $STAGE $*"; }
+
+pin_state() {
+    pin=$1
+    case "$RESERVED" in *" $pin "*) echo "gpio$pin: reserved, not read"; return ;; esac
+    addr=$((TLMM_BASE + pin * 0x1000))
+    if [ $((addr + 8)) -gt $TLMM_END ]; then
+        echo "gpio$pin: outside the TLMM window, not read"
+        return
+    fi
+    ctl=$(devmem "$addr" 32) || return
+    io=$(devmem $((addr + 4)) 32) || return
+    c=$((ctl))
+    i=$((io))
+    printf 'gpio%-3d ctl=0x%08x io=0x%08x func=%d drive=%dmA pull=%s oe=%d in=%d out=%d\n' \
+        "$pin" "$c" "$i" $(((c >> 2) & 15)) $((((c >> 6) & 7) * 2 + 2)) \
+        "$(case $((c & 3)) in 0) echo none ;; 1) echo down ;; 2) echo keeper ;; 3) echo up ;; esac)" \
+        $(((c >> 9) & 1)) $((i & 1)) $(((i >> 1) & 1))
+}
+
+pin_func() {
+    printf '%d' $((($(devmem $((TLMM_BASE + $1 * 0x1000)) 32) >> 2) & 15))
+}
+
+touch_pins() {
+    for p in 40 41 42 43 100 162; do pin_state "$p"; done
+}
+
+module_loaded() {
+    grep -q "^$1 " /proc/modules
+}
+
+load() {
+    if module_loaded "$(echo "$1" | tr - _)"; then
+        echo "$1 already loaded"
+        return 0
+    fi
+    modprobe "$1" || fail "modprobe $1 failed (rc=$?)"
+}
+
+wait_for() {
+    # wait_for SECONDS TEST...
+    t=$1
+    shift
+    while [ "$t" -gt 0 ]; do
+        "$@" && return 0
+        sleep 1
+        t=$((t - 1))
+    done
+    "$@"
+}
+
+touch_spi_device() {
+    for d in /sys/bus/spi/devices/*; do
+        [ -e "$d/of_node" ] || continue
+        case "$(readlink -f "$d/of_node")" in
+            */touchscreen@0) echo "$d"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+deferred() {
+    [ -r /sys/kernel/debug/devices_deferred ] \
+        || mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+    grep -E 'spi|pinctrl|a00000|touch' /sys/kernel/debug/devices_deferred 2>/dev/null \
+        || echo "(no touch-path device deferred)"
+}
+
+stage0() {
+    say "stage 0: preflight (read only), kernel $KVER"
+    [ -d "$DT/soc/pinctrl@f100000" ] || fail "DTBO lacks /soc/pinctrl@f100000 (wrong dtbo_b?)"
+    echo "tlmm node: $(tr -d '\0' < "$DT/soc/pinctrl@f100000/compatible")"
+    printf 'gpio-reserved-ranges:'
+    od -An -tx1 -v "$DT/soc/pinctrl@f100000/gpio-reserved-ranges" | tr -s ' \n' ' '
+    echo
+    [ -d "$SPI_DT/touchscreen@0" ] || fail "DTBO lacks spi@a88000/touchscreen@0"
+    echo "stock novatek@0: $(tr -d '\0' < "$SPI_DT/novatek@0/status" 2>/dev/null)"
+    echo "touch firmware candidates: $(tr '\0' ' ' < "$SPI_DT/touchscreen@0/firmware-name")"
+    for f in novatek_nt36532_piano_fw_csot.bin novatek_nt36532_piano_fw_boe.bin; do
+        [ -s "/lib/firmware/novatek/$f" ] || fail "missing /lib/firmware/novatek/$f"
+    done
+    for m in pinctrl-sm8750 gpi spi-geni-qcom nt36532e_ts uinput; do
+        grep -q "/$m.ko:" "/lib/modules/$KVER/modules.dep" 2>/dev/null \
+            || fail "module $m not in the image"
+    done
+    cp /sys/firmware/fdt /run/fdt.dtb 2>/dev/null && echo "device tree copy: /run/fdt.dtb"
+    if [ -d /run/pstore-prev ]; then
+        echo "previous boot pstore: $(ls /run/pstore-prev | tr '\n' ' ')"
+    else
+        echo "previous boot pstore: none"
+    fi
+    echo "TLMM pin state before any driver:"
+    touch_pins | tee /run/tlmm-pre.txt
+    pass
+}
+
+stage1() {
+    say "stage 1: loading pinctrl-sm8750 (TLMM probe)"
+    if [ -e "$TLMM_DEV/driver" ]; then
+        echo "TLMM already bound"
+    else
+        sleep 1
+        load pinctrl-sm8750
+        wait_for 5 test -e "$TLMM_DEV/driver" \
+            || fail "f100000.pinctrl did not bind: $(dmesg | grep -i f100000 | tail -3)"
+    fi
+    echo "bound to: $(basename "$(readlink "$TLMM_DEV/driver")")"
+    ls -d "$TLMM_DEV"/gpiochip* 2>/dev/null
+    dmesg | grep -iE 'f100000|msm_pinctrl|pinctrl-msm' | tail -5
+    echo "TLMM pin state after probe (expected unchanged):"
+    touch_pins
+    pass
+}
+
+stage2() {
+    say "stage 2: apps SMMU stream matches, loading gpi + spi-geni-qcom"
+    [ -e "$TLMM_DEV/driver" ] || fail "TLMM not bound; run stage 1 first"
+    piano-qup-smmu || fail "cannot add the QUP1 SMMU stream matches"
+    load gpi
+    load spi-geni-qcom
+    wait_for 5 test -e "$SPI_DEV/driver" || { deferred; fail "a88000.spi did not bind"; }
+    dev=$(wait_for 3 touch_spi_device) || fail "no SPI device for touchscreen@0"
+    echo "touch SPI device: ${dev##*/} ($(cat "$dev/modalias"))"
+    for p in 40 41 42 43; do
+        if [ "$(pin_func $p)" != 1 ]; then
+            echo "gpio$p not on qup1_se2: rebinding a88000.spi"
+            echo a88000.spi > /sys/bus/platform/drivers/geni_spi/unbind
+            echo a88000.spi > /sys/bus/platform/drivers/geni_spi/bind
+            sleep 1
+            break
+        fi
+    done
+    touch_pins
+    for p in 40 41 42 43; do
+        [ "$(pin_func $p)" = 1 ] || fail "gpio$p mux is $(pin_func $p), expected 1 (qup1_se2)"
+    done
+    pass "(SPI pins on qup1_se2)"
+}
+
+stage3() {
+    say "stage 3: loading nt36532e_ts (chip ID, firmware download)"
+    touch_spi_device > /dev/null || fail "no SPI device for touchscreen@0; run stage 2 first"
+    load nt36532e_ts
+    if ! wait_for 10 test -e /proc/nvt_thp_status; then
+        deferred
+        dmesg | grep -iE 'nvt|nt36|touch' | tail -30
+        fail "touch driver did not probe"
+    fi
+    wait_for 15 grep -q '^irq_enabled: 1' /proc/nvt_thp_status
+    dmesg | grep -iE 'NVT-ts|nt36' | tail -30
+    echo "--- /proc/nvt_thp_status"
+    cat /proc/nvt_thp_status
+    touch_pins
+    grep -q '^irq_enabled: 1' /proc/nvt_thp_status \
+        || fail "firmware download did not complete (IRQ still off)"
+    sleep 1
+    irqs=$(sed -n 's/^irqs: //p' /proc/nvt_thp_status)
+    echo "touch interrupts so far: $irqs"
+    pass
+}
+
+stage4() {
+    say "stage 4: touch test ($VIEW, ${VIEW_SECONDS}s)"
+    [ -e /proc/nvt_thp_status ] || fail "touch driver not loaded; run stage 3 first"
+    if pidof piano-touch-view > /dev/null; then
+        fail "piano-touch-view already runs (uinput, stage 5); reboot to test again"
+    fi
+    echo "do not touch the screen until 'reference ready', then draw"
+    piano-touch-view "$VIEW" --seconds "$VIEW_SECONDS"
+    rc=$?
+    cat /proc/nvt_thp_status
+    [ "$rc" = 0 ] || fail "no frame with a valid checksum (rc=$rc)"
+    pass
+}
+
+stage5() {
+    say "stage 5: uinput touchscreen"
+    [ -e /proc/nvt_thp_status ] || fail "touch driver not loaded; run stage 3 first"
+    if pidof piano-touch-view > /dev/null; then
+        echo "piano-touch-view already running (pid $(pidof piano-touch-view))"
+    else
+        load uinput
+        echo "keep fingers off the screen for a second (reference)"
+        (trap '' HUP; exec piano-touch-view input --seconds 0 \
+            > /run/touch-input.log 2>&1) &
+        sleep 2
+    fi
+    cat /run/touch-input.log
+    grep -A5 'piano NT36532' /proc/bus/input/devices \
+        || fail "no uinput touchscreen registered"
+    pass "(touchscreen active until reboot; log /run/touch-input.log)"
+}
+
+STAGE=$FIRST
+while [ "$STAGE" -le "$LAST" ]; do
+    case "$STAGE" in
+        0) stage0 ;; 1) stage1 ;; 2) stage2 ;; 3) stage3 ;; 4) stage4 ;;
+        5) stage5 ;;
+        *) echo "piano-touch-test: no stage $STAGE" >&2; exit 2 ;;
+    esac
+    STAGE=$((STAGE + 1))
+done
+exit 0

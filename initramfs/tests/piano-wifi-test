@@ -1,0 +1,86 @@
+#!/bin/sh
+# piano-wifi-test — WLAN (Qualcomm peach / WCN7850 family) bring-up check.
+#
+# Usage: piano-wifi-test [--scan]
+#
+# Stages reported:
+#   1. PCIe enumeration   — the peach WLAN function 17cb:110e on pcie0
+#   2. driver bind        — ath12k probe + MHI channels (dmesg)
+#   3. firmware download  — ath12k/WCN7850/hw2.0/{amss,m3,bdwlan,board-2}
+#   4. wiphy registration — /sys/class/ieee80211/phy*
+#   5. --scan: nl80211 scan via iw (full RF path proof; needs networks
+#      nearby — an empty scan list is still a PASS for radio bring-up)
+#
+# Nothing here writes to the device; read-only + nl80211 scan.
+
+SCAN=0
+[ "${1-}" = "--scan" ] && SCAN=1
+
+banner() {
+    echo
+    echo "=== piano WiFi test (peach / ath12k) ==="
+}
+
+fail_hints() {
+    echo
+    echo "--- hints ---"
+    echo "  no PCI device : pcie0 link/perst (GPIO102), wlan-en GPIO16, pmu regs"
+    echo "  no ath12k msg : 'modprobe ath12k_wifi7 ath12k' + ls /sys/bus/pci/drivers"
+    echo "  fw -2 ENOENT  : dmesg names the missing file; compare /lib/firmware"
+}
+
+banner
+
+echo "--- PCIe enumeration (17cb:110e expected) ---"
+FOUND=0
+for d in /sys/bus/pci/devices/*; do
+    [ -r "$d/vendor" ] || continue
+    ven=$(cat "$d/vendor"); dev=$(cat "$d/device")
+    if [ "$ven" = "0x17cb" ]; then
+        FOUND=1
+        bars=0; for r in "$d"/resource*; do [ -e "$r" ] && bars=$((bars + 1)); done
+        echo "  $(basename "$d"): $ven:$dev ($(cat "$d/class")) ${bars} BARs, enabled=$(cat "$d/enable" 2>/dev/null)"
+        ls -l "$d/driver" 2>/dev/null | sed 's|.*/|  bound to: |'
+    fi
+done
+[ "$FOUND" = 1 ] || echo "  NO Qualcomm WLAN PCI function found (pcie0 or power-up problem)"
+
+echo
+echo "--- wiphy ---"
+n_phy=0
+for p in /sys/class/ieee80211/*; do
+    [ -e "$p" ] || continue
+    n_phy=$((n_phy + 1))
+    echo "  $(basename "$p"): $(cat "$p/macaddress" 2>/dev/null)"
+done
+[ "$n_phy" -gt 0 ] || echo "  no ieee80211 phy (driver or firmware stage failed)"
+
+echo
+echo "--- loaded modules ---"
+lsmod | grep -E 'ath12k|^ath |mac80211|cfg80211|mhi|qrtr' || echo "  none loaded"
+
+echo
+echo "--- dmesg (ath12k/mhi/qrtr/pci) ---"
+dmesg 2>/dev/null | grep -iE 'ath12k|peach|wcn|mhi|qrtr|pcie.*link|firmware' | tail -30
+
+if command -v iw >/dev/null 2>&1; then
+    echo
+    echo "--- iw dev ---"
+    iw dev 2>&1 | head -20
+    if [ "$SCAN" = 1 ]; then
+        for w in /sys/class/ieee80211/*; do
+            [ -e "$w" ] || continue
+            ifc=$(ls "$w/device/net" 2>/dev/null | head -1)
+            [ -n "$ifc" ] || continue
+            echo "--- scan on $ifc ---"
+            ip link set "$ifc" up 2>/dev/null
+            iw dev "$ifc" scan 2>&1 | grep -E '^(BSS|.*SSID:|freq:|signal:)' | head -40
+            echo "(scan list above; empty list still proves the radio answered)"
+        done
+    fi
+else
+    echo
+    echo "  iw not installed (scan test unavailable)"
+fi
+
+fail_hints

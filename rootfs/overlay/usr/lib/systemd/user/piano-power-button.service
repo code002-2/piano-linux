@@ -1,0 +1,12 @@
+[Unit]
+Description=Piano power button and keyboard cover (short press / lid close: backlight, long press: power dialog)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/lib/piano/power-button
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

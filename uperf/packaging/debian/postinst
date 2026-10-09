@@ -1,0 +1,36 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # Reload the D-Bus daemon so the updated policy takes effect.
+        systemctl reload dbus 2>/dev/null \
+            || systemctl reload dbus-broker 2>/dev/null || true
+
+        systemctl daemon-reload 2>/dev/null || true
+        if systemctl is-active --quiet uperf-linux.service 2>/dev/null; then
+            systemctl restart uperf-linux.service 2>/dev/null || true
+        fi
+
+        echo "uperf-linux installed successfully."
+        echo "The daemon was not enabled automatically; review the generated device config first."
+        echo "Start daemon: sudo systemctl start uperf-linux"
+        echo "Control: uperfctl status"
+        echo "Launch GUI: uperf-gui"
+        echo
+        echo "Active desktop users can change normal modes through Polkit without re-login."
+        echo "Manual frequency overrides and config reloads request administrator authentication."
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+
+    *)
+        echo "postinst called with unknown argument '$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

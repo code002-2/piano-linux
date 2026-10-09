@@ -1,0 +1,13 @@
+[org/gnome/settings-daemon/plugins/media-keys]
+# The power key is owned by the piano-power-button user service (short
+# press: backlight off/on, long press: power-off/restart dialog).  gsd
+# must not bind it: with the "vm" chassis systemd reports on piano it
+# powers the system off on every press.
+power-static=['']
+
+[org/gnome/settings-daemon/plugins/power]
+power-button-action='nothing'
+
+[org/gnome/desktop/session]
+# Never blank: DPMS off of the native display does not recover yet.
+idle-delay=uint32 0

@@ -1,0 +1,46 @@
+#!/bin/sh
+# keyboard-start: keyboard-cover bring-up (piano-keyboard service).
+#
+# Runs after piano-touch, which loads the QUP1 GPI DMA controller that the
+# keyboard I2C bus (QUP1 SE6) shares with the touchscreen SPI, and after
+# piano-display, which loads the GENI I2C driver. Nothing autoloads the
+# keyboard driver (of: modaliases are skipped by 80-drivers.rules).
+#
+# On probe the driver powers the MCU (L11B 1.8 V first, then L14B 3.3 V),
+# downloads nanosic/MCU_Upgrade.bin into its RAM and registers the
+# keyboard and touchpad HID devices once the cover reports itself.
+# /etc/piano/keyboard.conf may set KEYBOARD_START=0 to skip everything.
+set -eu
+
+KEYBOARD_START=1
+# shellcheck source=/dev/null
+[ ! -r /etc/piano/keyboard.conf ] || . /etc/piano/keyboard.conf
+
+BUS=/sys/bus/platform/devices/a98000.i2c
+
+say() {
+    echo "piano-keyboard: $*"
+    echo "piano-keyboard: $*" > /dev/kmsg 2>/dev/null || true
+}
+
+die() {
+    say "FAIL: $*"
+    exit 1
+}
+
+[ "$KEYBOARD_START" = 1 ] || { say "disabled by /etc/piano/keyboard.conf"; exit 0; }
+
+n=0
+until [ -e "$BUS/driver" ]; do
+    [ "$n" -lt 100 ] || die 'SE6 I2C bus not bound (GPI or GENI I2C missing?)'
+    sleep 0.1; n=$((n + 1))
+done
+
+modprobe hid_nanosic_wn8030
+
+n=0
+until CLIENT=$(ls -d "$BUS"/i2c-*/*-004c 2>/dev/null) && [ -e "$CLIENT/driver" ]; do
+    [ "$n" -lt 100 ] || die 'keyboard MCU not bound'
+    sleep 0.1; n=$((n + 1))
+done
+say "DONE $(cat /sys/class/input/input*/name 2>/dev/null | grep -i xiaomi | tr '\n' ' ')"

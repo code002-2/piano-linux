@@ -1,0 +1,7 @@
+# Installed from trixie-backports (dependencies included); one package per
+# line, main only.
+# Cameras: PipeWire 1.6 and GNOME Snapshot offer the v4l2loopback cameras
+# that piano-camerad feeds.
+gnome-snapshot
+gstreamer1.0-pipewire
+pipewire-audio

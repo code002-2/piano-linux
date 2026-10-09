@@ -1,0 +1,11 @@
+# Piano override of systemd's 80-drivers.rules.
+# The stock downstream DT exposes many SoC nodes whose mainline drivers
+# (coresight, fastrpc, apr, pmic_glink, lpg, slimbus, ...) were never
+# validated on piano; coldplug autoloading them froze the display right
+# after systemd-udev-trigger.  SoC-bus drivers are loaded only by the
+# ordered piano-* services (like the test image); USB/HID/input still
+# autoload.
+ACTION!="add", GOTO="drivers_end"
+ENV{MODALIAS}=="of:*|platform:*|amba:*|spmi:*|auxiliary:*|slim:*|rpmsg:*|qcom-*", GOTO="drivers_end"
+ENV{MODALIAS}=="?*", RUN{builtin}+="kmod load"
+LABEL="drivers_end"

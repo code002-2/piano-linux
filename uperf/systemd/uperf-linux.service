@@ -1,0 +1,41 @@
+[Unit]
+Description=Uperf-Linux Userspace Performance Scheduler
+Documentation=https://github.com/code002-2/uperf-linux
+After=dbus.service
+
+[Service]
+Type=dbus
+ExecStart=/usr/bin/uperf-linux --config /etc/uperf-linux/config.json
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=uperf-linux
+
+# Runtime directory for state files and DBus socket
+RuntimeDirectory=uperf-linux
+RuntimeDirectoryPreserve=restart
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/uperf-linux /run/uperf-linux
+# ProtectHome=yes would also hide /run/user, where user-manager control
+# sockets live. Hide actual home directories explicitly while exposing the
+# runtime tree read-only.
+ProtectHome=no
+InaccessiblePaths=/home /root
+ReadOnlyPaths=/run/user
+
+Slice=system.slice
+
+# Required capabilities
+CapabilityBoundingSet=CAP_SYS_NICE CAP_SYS_RESOURCE CAP_DAC_OVERRIDE
+AmbientCapabilities=CAP_SYS_NICE CAP_SYS_RESOURCE CAP_DAC_OVERRIDE
+
+# DBus activation
+BusName=org.uperflinux.Daemon
+
+[Install]
+WantedBy=multi-user.target

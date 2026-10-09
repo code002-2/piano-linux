@@ -1,0 +1,646 @@
+/*
+ * WLAN/BT bring-up overlay (peach / WCN7850 family combo), stacked on the
+ * device-verified milestone-touch overlay.  Everything below follows the
+ * same rules as dtbo-piano-touch-v2.dts: the live base tree is the stock
+ * vendor DTB (1-cell /soc addressing), fragments only add or override, and
+ * every risky consumer is bound to a module driver that the initramfs
+ * loads in a staged, observable order after the debug shell is up.
+ *
+ * Hardware facts (cross-checked against the stock tree):
+ *   - WLAN half: PCI 17cb:110e on pcie0 (stock qcom,cnss-peach@b0000000,
+ *     supported-ids = <0x110e>), WLAN_EN = TLMM gpio16, PERST# = gpio102,
+ *     CLKREQ# = gpio103, WAKE = gpio104, RF clock = RPMh RF_CLK1.
+ *   - BT half: SE14 UART on QUP2 (TX gpio26, RX gpio27, CTS gpio24,
+ *     RTS gpio25 -- stock qupv3_se14_* states), BT_EN = PM8550VE-F
+ *     gpio3 (stock qcom,bt-en-gpio = <&pm8550ve_f_gpios 3>).
+ *   - Combo PMU input rails (stock cnss/bt supply phandles resolved to
+ *     the downstream rpmh regulator nodes): vdd/vdddig = S5F, vddaon =
+ *     S4D, vddio = L3F, vddio1p2 = L2F, vddrfa1p2 = S7I, vddrfa1p8 = S3G.
+ *
+ * The mainline rpmh-regulator driver cannot bind the downstream VRM nodes
+ * (children of the non-compatible drv@2 node, vendor compatible), so the
+ * exact regulator set the PMU needs is re-declared as mainline blocks
+ * directly under apps_rsc — the same pattern that already carries
+ * rpmhcc/bcm-voter (fragment@215 of the milestone-1 base).  Each window
+ * starts at the stock qcom,init-voltage and every rail is always-on: they
+ * are shared parents of display/USB rails, so HLOS must never drop the
+ * APPS vote.  L3G also supplies the DSI and USB PHYs; up to R17 the PCIe
+ * PHY owned it, so any disable on the PCIe error path cut the live panel
+ * and the NCM link (matching the observed screen corruption + reset).
+ *
+ * pcie0 keeps the stock ranges/dma-coherent but moves reg/interrupts/
+ * clocks/resets to the mainline layout.  The stock iommu-map/msi-map are
+ * DELETED: the apps SMMU stays on its downstream compatible (no driver),
+ * so an iommu-map would defer every PCI function forever, and the msi-map
+ * target (downstream qcom,pci-msi controller) is disabled.  MSI runs on
+ * the eight dedicated msi0..msi7 SPI lines; the SMMU stream matches for
+ * 0x1400/0x1401 are added from the initramfs (piano-qup-smmu).
+ */
+#include "dtbo-piano-touch-v2.dts"
+
+#include <dt-bindings/clock/qcom,rpmh.h>
+#include <dt-bindings/clock/qcom,sm8750-gcc.h>
+#include <dt-bindings/clock/qcom,sm8750-tcsr.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interconnect/qcom,icc.h>
+#include <dt-bindings/interconnect/qcom,sm8750-rpmh.h>
+#include <dt-bindings/regulator/qcom,rpmh-regulator.h>
+
+/ {
+	/*
+	 * mainline rpmh regulators for the WCN PMU input rails (see header).
+	 *
+	 * R18: every rail is always-on and its window starts at the stock
+	 * qcom,init-voltage.  These are shared parents (S3G feeds the panel
+	 * LDO L12B, S7I feeds L3G = DSI/USB PHY 1.2 V) and the APPS DRV vote
+	 * is the one the bootloader left behind: a consumer disable on the
+	 * error path, or a registration-time vote below the stock voltage,
+	 * pulls those rails out from under the live display and the NCM link.
+	 * L1F/L3G/S1D are no longer declared at all (see fragment@233/234).
+	 */
+	fragment@229 {
+		target = <&apps_rsc>;
+		__overlay__ {
+			wcn_regs_d: regulators-0 {
+				compatible = "qcom,pm8550ve-rpmh-regulators";
+				vdd-s4-supply = <&vph_pwr_ml>;
+				qcom,pmic-id = "d";
+
+				vreg_s4d_0p85_ml: smps4 {
+					regulator-name = "vreg_s4d_0p85_ml";
+					regulator-min-microvolt = <852000>;
+					regulator-max-microvolt = <1036000>;
+					regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+					regulator-always-on;
+				};
+			};
+
+			wcn_regs_f: regulators-1 {
+				compatible = "qcom,pm8550ve-rpmh-regulators";
+				vdd-l2-supply = <&vreg_s7i_1p2_ml>;
+				vdd-l3-supply = <&vreg_s3g_1p8_ml>;
+				vdd-s5-supply = <&vph_pwr_ml>;
+				qcom,pmic-id = "f";
+
+				vreg_s5f_0p85_ml: smps5 {
+					regulator-name = "vreg_s5f_0p85_ml";
+					regulator-min-microvolt = <852000>;
+					regulator-max-microvolt = <1000000>;
+					regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+					regulator-always-on;
+				};
+
+				vreg_l2f_1p2_ml: ldo2 {
+					regulator-name = "vreg_l2f_1p2_ml";
+					regulator-min-microvolt = <1200000>;
+					regulator-max-microvolt = <1200000>;
+					regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+					regulator-always-on;
+				};
+
+				vreg_l3f_1p8_ml: ldo3 {
+					regulator-name = "vreg_l3f_1p8_ml";
+					regulator-min-microvolt = <1800000>;
+					regulator-max-microvolt = <1800000>;
+					regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+					regulator-always-on;
+				};
+			};
+
+			wcn_regs_g: regulators-2 {
+				compatible = "qcom,pm8550ve-rpmh-regulators";
+				vdd-s3-supply = <&vph_pwr_ml>;
+				qcom,pmic-id = "g";
+
+				vreg_s3g_1p8_ml: smps3 {
+					regulator-name = "vreg_s3g_1p8_ml";
+					regulator-min-microvolt = <1856000>;
+					regulator-max-microvolt = <2000000>;
+					regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+					regulator-always-on;
+				};
+			};
+
+			wcn_regs_i: regulators-3 {
+				compatible = "qcom,pm8550ve-rpmh-regulators";
+				vdd-s7-supply = <&vph_pwr_ml>;
+				qcom,pmic-id = "i";
+
+				vreg_s7i_1p2_ml: smps7 {
+					regulator-name = "vreg_s7i_1p2_ml";
+					regulator-min-microvolt = <1256000>;
+					regulator-max-microvolt = <1340000>;
+					regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+					regulator-always-on;
+				};
+			};
+		};
+	};
+
+	/* board main rail dummy + the combo PMU (power sequencer unit) */
+	fragment@230 {
+		target-path = "/";
+		__overlay__ {
+			vph_pwr_ml: vph-pwr-regulator-ml {
+				compatible = "regulator-fixed";
+				regulator-name = "vph_pwr_ml";
+				regulator-min-microvolt = <3700000>;
+				regulator-max-microvolt = <3700000>;
+				regulator-always-on;
+				regulator-boot-on;
+			};
+
+			/*
+			 * Stand-in for L1F (0.88 V) and L3G (1.2 V), the PCIe PHY
+			 * rails.  Both also feed the DSI and USB PHYs and stay on
+			 * for the whole session; the stock pcie0 node does not vote
+			 * them either.  HLOS must never switch them.
+			 */
+			pcie0_phy_rails_ml: pcie0-phy-rails-ml {
+				compatible = "regulator-fixed";
+				regulator-name = "pcie0_phy_rails_ml";
+				regulator-always-on;
+				regulator-boot-on;
+			};
+
+			/*
+			 * R20: stand-in for TCSR_PCIE_0_CLKREF_EN.  The base overlay
+			 * (fragment@202) turned the stock syscon@1fc0000 into the
+			 * mainline tcsrcc, but the clkref block lives at 0xf204008
+			 * (stock and mainline tcsrcc agree; PCIe0 = offset 0x0).
+			 * R19 reset exactly when the PHY enabled "ref", i.e. wrote
+			 * bit 0 of 0x1fc0000.  The initramfs sets the real enable
+			 * bit before the PHY loads; the PHY only sees this dummy.
+			 */
+			pcie0_clkref_ml: pcie0-clkref-ml {
+				compatible = "fixed-clock";
+				#clock-cells = <0>;
+				clock-frequency = <19200000>;
+				clock-output-names = "pcie0_clkref_ml";
+			};
+
+			/*
+			 * Peach v2 combo (WCN7861 in the Lenovo Y700 Gen4 port):
+			 * WCN7850 rails plus the AOSS/PDC setup the stock cnss2
+			 * and btpower drivers send (qcom,pdc_init_table,
+			 * qcom,vreg_pdc_map and qcom,pmu_vreg_map of the stock
+			 * cnss-peach / bt_peach nodes).
+			 *
+			 * The reference clock is RPMh RF_CLK1, which stock
+			 * btpower votes for as long as BT is on ("bt_rf_clk1" in
+			 * bt_peach).  Without that vote the Brahma controller
+			 * came up and answered HCI while busy, then stopped
+			 * responding after some idle time without any host
+			 * sleep indication having been sent.
+			 */
+			wcn7850_pmu_ml: wcn7850-pmu {
+				compatible = "qcom,wcn7861-pmu";
+
+				clocks = <&rpmhcc_ml RPMH_RF_CLK1>;
+
+				qcom,qmp = <&aoss_qmp>;
+				qcom,pdc-init-table =
+					"{class: wlan_pdc, ss: rf, res: s5f.m, enable: 1}",
+					"{class: wlan_pdc, ss: rf, res: s5f.v, enable: 1}",
+					"{class: wlan_pdc, ss: rf, res: s5f.v, upval: 876}",
+					"{class: wlan_pdc, ss: rf, res: s5f.v, dwnval: 876}";
+				qcom,vreg-pdc-map = "s5f:rf", "s4d:bb", "s3g:rf",
+						    "s7i:rf";
+				qcom,pmu-vreg-map =
+					"VDDD_AON_0P9:s5f", "VDDA_RFA_1P9:s3g",
+					"VDDA_RFA_1P3:s7i", "VDDA_RFA_0P9:s5f",
+					"VDDD_WLMX_0P9:s4d", "VDDD_WLCX_0P9:s5f",
+					"VDDD_BTCX_0P9:s5f", "VDDD_BTCMX_0P9:s5f",
+					"VDDA_PCIE_1P2:s7i", "VDDA_PCIE_0P9:s7i";
+
+				pinctrl-names = "default";
+				pinctrl-0 = <&wlan_en_ml>, <&bt_en_ml>;
+
+				wlan-enable-gpios = <&piano_tlmm_ml 16 GPIO_ACTIVE_HIGH>;
+			/* Round 6: restored — the qcom-spmi-gpio chips are all
+			 * bound (field log 5); the earlier defer is moot. */
+			bt-enable-gpios = <&pm8550ve_f_gpios 3 GPIO_ACTIVE_HIGH>;
+
+				vdd-supply = <&vreg_s5f_0p85_ml>;
+				vddio-supply = <&vreg_l3f_1p8_ml>;
+				vddio1p2-supply = <&vreg_l2f_1p2_ml>;
+				vddaon-supply = <&vreg_s4d_0p85_ml>;
+				vdddig-supply = <&vreg_s5f_0p85_ml>;
+				vddrfa1p2-supply = <&vreg_s7i_1p2_ml>;
+				vddrfa1p8-supply = <&vreg_s3g_1p8_ml>;
+
+
+				regulators {
+					vreg_pmu_rfa_cmn_ml: ldo0 {
+						regulator-name = "vreg_pmu_rfa_cmn";
+					};
+
+					vreg_pmu_aon_0p59_ml: ldo1 {
+						regulator-name = "vreg_pmu_aon_0p59";
+					};
+
+					vreg_pmu_wlcx_0p8_ml: ldo2 {
+						regulator-name = "vreg_pmu_wlcx_0p8";
+					};
+
+					vreg_pmu_wlmx_0p85_ml: ldo3 {
+						regulator-name = "vreg_pmu_wlmx_0p85";
+					};
+
+					vreg_pmu_btcmx_0p85_ml: ldo4 {
+						regulator-name = "vreg_pmu_btcmx_0p85";
+					};
+
+					vreg_pmu_rfa_0p8_ml: ldo5 {
+						regulator-name = "vreg_pmu_rfa_0p8";
+					};
+
+					vreg_pmu_rfa_1p2_ml: ldo6 {
+						regulator-name = "vreg_pmu_rfa_1p2";
+					};
+
+					vreg_pmu_rfa_1p8_ml: ldo7 {
+						regulator-name = "vreg_pmu_rfa_1p8";
+					};
+
+					vreg_pmu_pcie_0p9_ml: ldo8 {
+						regulator-name = "vreg_pmu_pcie_0p9";
+					};
+
+					vreg_pmu_pcie_1p8_ml: ldo9 {
+						regulator-name = "vreg_pmu_pcie_1p8";
+					};
+				};
+			};
+		};
+	};
+
+	/*
+	 * BT_EN (stock bt_uwb_en): PM8550VE-F gpio3 as a normal output on
+	 * power source 1, as the stock tree configures it.  The bootloader
+	 * leaves it on vin-2, where the Brahma controller still boots and
+	 * answers HCI but its radio is effectively disconnected: a few
+	 * advertising reports per 10 s scan, and invisible to a phone next to
+	 * it.  On power source 1 the same scan sees hundreds of reports.
+	 */
+	fragment@239 {
+		/* by path: the pm8550ve_f_gpios label is local to this overlay */
+		target-path = "/soc/qcom,spmi@c42d000/qcom,pm8550ve@5/pinctrl@8800";
+		__overlay__ {
+			bt_en_ml: bt-en-state {
+				pins = "gpio3";
+				function = "normal";
+				power-source = <1>;
+				output-enable;
+				input-disable;
+				bias-disable;
+			};
+		};
+	};
+
+	/* board pin states on the mainline TLMM node (touch-v2 fragment@226) */
+	fragment@231 {
+		target-path = "/soc/pinctrl@f100000";
+		__overlay__ {
+			/* stock wlan_en_active: gpio16, drive 8, pull-down */
+			wlan_en_ml: wlan-en-state {
+				pins = "gpio16";
+				function = "gpio";
+				drive-strength = <8>;
+				bias-pull-down;
+			};
+
+			/*
+			 * uart14 lanes with the stock qupv3_se14_{cts,rts,tx,
+			 * rx_active} biases: CTS l0 gpio24 no bias, RTS l1 gpio25
+			 * pull-down, TX l2 gpio26 pull-up, RX l3 gpio27 no bias.
+			 */
+			qup_uart14_default_ml: qup-uart14-default-state {
+				cts-pins {
+					pins = "gpio24";
+					function = "qup2_se6";
+					drive-strength = <2>;
+					bias-disable;
+				};
+
+				rts-pins {
+					pins = "gpio25";
+					function = "qup2_se6";
+					drive-strength = <2>;
+					bias-pull-down;
+				};
+
+				tx-pins {
+					pins = "gpio26";
+					function = "qup2_se6";
+					drive-strength = <2>;
+					bias-pull-up;
+				};
+
+				rx-pins {
+					pins = "gpio27";
+					function = "qup2_se6";
+					drive-strength = <2>;
+					bias-disable;
+				};
+			};
+
+			/* upstream pcie0-default-state: perst/clkreq/wake */
+			pcie0_default_ml: pcie0-default-state {
+				perst-pins {
+					pins = "gpio102";
+					function = "gpio";
+					drive-strength = <2>;
+					bias-pull-down;
+				};
+
+				clkreq-pins {
+					pins = "gpio103";
+					function = "pcie0_clk_req_n";
+					drive-strength = <2>;
+					bias-pull-up;
+				};
+
+				wake-pins {
+					pins = "gpio104";
+					function = "gpio";
+					drive-strength = <2>;
+					bias-pull-up;
+				};
+			};
+		};
+	};
+
+	/* BT HCI UART: SE14 as a mainline geni-uart with the hci_qca serdev
+	 * child (pwrseq "bluetooth" target powers it before fw download) */
+	fragment@232 {
+		target-path = "/soc/qcom,qupv3_2_geni_se@8c0000/qcom,qup_uart@898000";
+		__overlay__ {
+			compatible = "qcom,geni-uart";
+			status = "okay";
+			current-speed = <115200>;
+
+			clocks = <&gcc GCC_QUPV3_WRAP2_S6_CLK>;
+			clock-names = "se";
+
+			interconnects = <&clk_virt MASTER_QUP_CORE_2 QCOM_ICC_TAG_ALWAYS
+					 &clk_virt SLAVE_QUP_CORE_2 QCOM_ICC_TAG_ALWAYS>,
+					<&gem_noc MASTER_APPSS_PROC QCOM_ICC_TAG_ALWAYS
+					 &config_noc SLAVE_QUP_2 QCOM_ICC_TAG_ALWAYS>;
+			interconnect-names = "qup-core", "qup-config";
+
+			pinctrl-names = "default";
+			pinctrl-0 = <&qup_uart14_default_ml>;
+			/* drop the vendor active/sleep/shutdown state phandles:
+			 * they mux via qup2_se6_lN lane variants that only the
+			 * downstream Sun pinctrl driver implements */
+			pinctrl-1;
+			pinctrl-2;
+			pinctrl-3;
+
+			bluetooth {
+				compatible = "qcom,wcn7861-bt";
+
+				vddrfacmn-supply = <&vreg_pmu_rfa_cmn_ml>;
+				vddaon-supply = <&vreg_pmu_aon_0p59_ml>;
+				vddwlcx-supply = <&vreg_pmu_wlcx_0p8_ml>;
+				vddwlmx-supply = <&vreg_pmu_wlmx_0p85_ml>;
+				vddrfa0p8-supply = <&vreg_pmu_rfa_0p8_ml>;
+				vddrfa1p2-supply = <&vreg_pmu_rfa_1p2_ml>;
+				vddrfa1p8-supply = <&vreg_pmu_rfa_1p8_ml>;
+
+				/*
+				 * Brahma v2 (product 0x21, ROM 0x200): the stock HAL
+				 * skips the 0xfc48 baud change and downloads at the
+				 * init rate; hci_qca does the same for this tuple.
+				 * 8 Mbaud is only written into the NVM HCI tag.
+				 */
+				max-speed = <8000000>;
+				firmware-name = "brhbtnv20.bin", "brhbtfw20.tlv";
+
+				/*
+				 * The factory address lives in the Android persist
+				 * partition; until that is read, use a locally
+				 * administered one (02:50:49:41:4e:4f, "PIANO"),
+				 * little-endian as the binding requires.  Only used
+				 * when the controller reports its default address.
+				 */
+				local-bd-address = [4f 4e 41 49 50 02];
+			};
+		};
+	};
+
+	/* pcie0: mainline binding on the stock node (module driver) */
+	fragment@233 {
+		target-path = "/soc/pcie@1c00000";
+		__overlay__ {
+			compatible = "qcom,pcie-sm8750", "qcom,pcie-sm8550";
+
+			reg = <0x1c00000 0x3000>,
+			      <0x40000000 0xf1d>,
+			      <0x40000f20 0xa8>,
+			      <0x40001000 0x1000>,
+			      <0x40100000 0x100000>,
+			      <0x1c03000 0x1000>;
+			reg-names = "parf", "dbi", "elbi", "atu", "config", "mhi";
+
+			bus-range = <0x00 0xff>;
+			num-lanes = <2>;
+
+			interrupts = <GIC_SPI 141 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 142 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 143 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 144 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 145 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 146 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 147 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 148 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 140 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "msi0", "msi1", "msi2", "msi3",
+					  "msi4", "msi5", "msi6", "msi7",
+					  "global";
+
+			#interrupt-cells = <1>;
+			interrupt-map-mask = <0 0 0 0x7>;
+			interrupt-map = <0 0 0 1 &intc 0 0 GIC_SPI 149 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 2 &intc 0 0 GIC_SPI 150 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 3 &intc 0 0 GIC_SPI 151 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 4 &intc 0 0 GIC_SPI 152 IRQ_TYPE_LEVEL_HIGH>;
+
+			clocks = <&gcc GCC_PCIE_0_AUX_CLK>,
+				 <&gcc GCC_PCIE_0_CFG_AHB_CLK>,
+				 <&gcc GCC_PCIE_0_MSTR_AXI_CLK>,
+				 <&gcc GCC_PCIE_0_SLV_AXI_CLK>,
+				 <&gcc GCC_PCIE_0_SLV_Q2A_AXI_CLK>,
+				 <&gcc GCC_DDRSS_PCIE_SF_QTB_CLK>,
+				 <&gcc GCC_AGGRE_NOC_PCIE_AXI_CLK>,
+				 <&gcc GCC_CNOC_PCIE_SF_AXI_CLK>;
+			clock-names = "aux", "cfg", "bus_master", "bus_slave",
+				      "slave_q2a", "ddrss_sf_tbu", "noc_aggr",
+				      "cnoc_sf_axi";
+
+			resets = <&gcc GCC_PCIE_0_BCR>;
+			reset-names = "pci";
+
+			/* ops_1_9_0 get_resources: bulk_get("vdda","vddpe-3v3")
+			 * fails -ENODEV (silently!) when the properties are
+			 * absent — root cause of every -61 field round. */
+			vdda-supply = <&pcie0_phy_rails_ml>;
+			vddpe-3v3-supply = <&vph_pwr_ml>;
+
+			power-domains = <&gcc GCC_PCIE_0_GDSC>;
+
+			pinctrl-names = "default";
+			pinctrl-0 = <&pcie0_default_ml>;
+			pinctrl-1;
+			/* Round 9: the -61 was qcom_pcie_icc_init's
+			 * devm_of_icc_get("pcie-mem") returning -ENODEV for
+			 * the neutered property — give pcie0 the upstream
+			 * 2-cell paths (pcie_noc is mainlined in
+			 * fragment@238, same treatment as the other NoCs). */
+			interconnects = <&pcie_noc MASTER_PCIE_0 QCOM_ICC_TAG_ALWAYS
+					 &mc_virt SLAVE_EBI1 QCOM_ICC_TAG_ALWAYS>,
+					<&gem_noc MASTER_APPSS_PROC QCOM_ICC_TAG_ALWAYS
+					 &cnoc_main SLAVE_PCIE_0 QCOM_ICC_TAG_ALWAYS>;
+			interconnect-names = "pcie-mem", "cpu-pcie";
+			gdsc-phy-vdd-supply;
+			qcom,bw-scale;
+			/* downstream msi/iommu maps (see header comment) */
+			msi-map;
+			iommu-map;
+			/* vendor gpio prop names; the mainline driver takes
+			 * PERST# from the port child node (fragment@235) */
+			perst-gpio;
+			wake-gpio;
+
+			status = "okay";
+		};
+	};
+
+	/* QMP gen3x2 PCIe phy for pcie0 (upstream sm8750.dtsi content) */
+	fragment@234 {
+		target-path = "/soc";
+		__overlay__ {
+			pcie0_phy_ml: phy@1c06000 {
+				compatible = "qcom,sm8750-qmp-gen3x2-pcie-phy";
+				reg = <0x1c06000 0x2000>;
+
+				clocks = <&gcc GCC_PCIE_0_AUX_CLK>,
+					 <&gcc GCC_PCIE_0_CFG_AHB_CLK>,
+					 <&pcie0_clkref_ml>,
+					 <&gcc GCC_PCIE_0_PHY_RCHNG_CLK>,
+					 <&gcc GCC_PCIE_0_PIPE_CLK>;
+				clock-names = "aux", "cfg_ahb", "ref", "rchng",
+					      "pipe";
+
+				assigned-clocks = <&gcc GCC_PCIE_0_PHY_RCHNG_CLK>;
+				assigned-clock-rates = <100000000>;
+
+				resets = <&gcc GCC_PCIE_0_PHY_BCR>;
+				reset-names = "phy";
+
+				power-domains = <&gcc GCC_PCIE_0_PHY_GDSC>;
+
+				vdda-phy-supply = <&pcie0_phy_rails_ml>;
+				vdda-pll-supply = <&pcie0_phy_rails_ml>;
+
+				#clock-cells = <0>;
+				clock-output-names = "pcie0_pipe_clk";
+
+				#phy-cells = <0>;
+
+				status = "okay";
+			};
+		};
+	};
+
+	/* root port: PERST#/WAKE on the port node (mainline convention) and
+	 * the pwrctrl child that powers the combo before the link trains */
+	fragment@235 {
+		target-path = "/soc/pcie@1c00000/pcie0_rp";
+		__overlay__ {
+			device_type = "pci";
+			bus-range = <0x01 0xff>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges;
+
+			wake-gpios = <&piano_tlmm_ml 104 GPIO_ACTIVE_LOW>;
+			reset-gpios = <&piano_tlmm_ml 102 GPIO_ACTIVE_LOW>;
+
+			/* Round-3 fix: the 7.2.6 pcie-qcom driver takes the PHY
+			 * from the ROOT PORT node (devm_of_phy_get inside
+			 * qcom_pcie_parse_port); without it the probe failed
+			 * -ENODEV and fell back to the legacy host binding.
+			 */
+			phys = <&pcie0_phy_ml>;
+
+			/*
+			 * The stock cnss2 child also sits at devfn 0 and comes
+			 * first, so of_pci_find_child_device() gave the endpoint
+			 * its node instead of wifi@0: no PMU supplies, and the
+			 * Peach OL-CPR pwrseq lookup deferred forever.  An empty
+			 * reg takes it out of the devfn match.
+			 */
+			cnss_pci0 {
+				reg;
+			};
+
+			wifi@0 {
+				compatible = "pci17cb,110e";
+				reg = <0x10000 0x0 0x0 0x0 0x0>;
+
+				/*
+				 * The Peach OTP carries no MAC address (the WMI
+				 * ready event reports zeroes; Android pushes one
+				 * from persist).  Locally administered fallback,
+				 * next to the Bluetooth one.
+				 */
+				local-mac-address = [02 50 49 41 4e 50];
+
+				vddrfacmn-supply = <&vreg_pmu_rfa_cmn_ml>;
+				vddaon-supply = <&vreg_pmu_aon_0p59_ml>;
+				vddwlcx-supply = <&vreg_pmu_wlcx_0p8_ml>;
+				vddwlmx-supply = <&vreg_pmu_wlmx_0p85_ml>;
+				vddrfa0p8-supply = <&vreg_pmu_rfa_0p8_ml>;
+				vddrfa1p2-supply = <&vreg_pmu_rfa_1p2_ml>;
+				vddrfa1p8-supply = <&vreg_pmu_rfa_1p8_ml>;
+				vddpcie0p9-supply = <&vreg_pmu_pcie_0p9_ml>;
+				vddpcie1p8-supply = <&vreg_pmu_pcie_1p8_ml>;
+			};
+		};
+	};
+
+	/*
+	 * Round-2 fix (field log 2026-09-26): uart14 deferred forever on
+	 * "supplier f000000.pinctrl not ready" — the stock interrupts-extended
+	 * carries a TLMM gpio27 wake phandle into the never-bound vendor TLMM
+	 * node.  Drop it for the upstream single-GIC interrupt form.
+	 */
+	fragment@236 {
+		target-path = "/soc/qcom,qupv3_2_geni_se@8c0000/qcom,qup_uart@898000";
+		__overlay__ {
+			interrupts = <GIC_SPI 461 IRQ_TYPE_LEVEL_HIGH>;
+			interrupts-extended;
+		};
+	};
+
+	/*
+	 * Round 9: pcie_noc mainline binding — qcom_pcie_icc_init resolves
+	 * the pcie-mem/cpu-pcie paths through it (same treatment as the
+	 * other NoCs in the milestone-1 base; the vendor clocks and the
+	 * downstream pcie_crm voter phandle are replaced by the HLOS one).
+	 */
+	fragment@238 {
+		target = <&pcie_noc>;
+		__overlay__ {
+			compatible = "qcom,sm8750-pcie-anoc";
+			#interconnect-cells = <2>;
+			qcom,bcm-voter-names = "hlos";
+			qcom,bcm-voters = <&apps_bcm_voter_ml>;
+			clocks = <&gcc GCC_AGGRE_UFS_PHY_AXI_CLK>,
+				 <&gcc GCC_AGGRE_USB3_PRIM_AXI_CLK>;
+		};
+	};
+
+};

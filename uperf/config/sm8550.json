@@ -1,0 +1,280 @@
+{
+  "meta": {
+    "name": "sm8550 [2026.07]",
+    "author": "uperf-linux contributors"
+  },
+
+  "modules": {
+    "switcher": {
+      "switchInode": "/run/uperf-linux/cur_powermode",
+      "perapp": "/etc/uperf-linux/perapp_powermode",
+      "hintDuration": {
+        "idle": 0.0,
+        "touch": 4.0,
+        "trigger": 0.03,
+        "gesture": 0.1,
+        "junk": 0.06,
+        "switch": 0.4,
+        "boost": 0.0
+      }
+    },
+
+    "input": {
+      "enable": true,
+      "screen_width": 3048,
+      "screen_height": 2032,
+      "swipeThd": 0.03,
+      "gestureThdX": 0.03,
+      "gestureThdY": 0.03,
+      "gestureDelayTime": 2.0,
+      "holdEnterTime": 1.0
+    },
+
+    "cpu": {
+      "enable": true,
+      "powerModel": [
+        {
+          "efficiency": 350,
+          "nr": 1,
+          "cpumask": "prime",
+          "typicalPower": 1.4,
+          "typicalFreq": 2957,
+          "sweetFreq": 2218,
+          "plainFreq": 1626,
+          "freeFreq": 739
+        },
+        {
+          "efficiency": 265,
+          "nr": 4,
+          "cpumask": "performance",
+          "typicalPower": 1.1,
+          "typicalFreq": 2803,
+          "sweetFreq": 2102,
+          "plainFreq": 1542,
+          "freeFreq": 701
+        },
+        {
+          "efficiency": 180,
+          "nr": 3,
+          "cpumask": "efficiency",
+          "typicalPower": 0.8,
+          "typicalFreq": 2016,
+          "sweetFreq": 1512,
+          "plainFreq": 1109,
+          "freeFreq": 504
+        }
+      ]
+    },
+
+    "sysfs": {
+      "enable": true,
+      "knob": {
+        "cpufreqMax": "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_max_freq",
+        "cpufreqMin": "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_min_freq",
+        "cpufreqGovernor": "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_governor",
+        "gpuMaxFreq": "/sys/class/devfreq/3d00000.gpu/max_freq",
+        "gpuMinFreq": "/sys/class/devfreq/3d00000.gpu/min_freq",
+        "gpuGovernor": "/sys/class/devfreq/3d00000.gpu/governor"
+      }
+    },
+
+    "thermal": {
+      "enabled": true,
+      "warn_temp": 70000,
+      "throttle_temp": 80000,
+      "critical_temp": 95000,
+      "recovery_temp": 75000
+    },
+
+    "sched": {
+      "enable": true,
+      "cpumask": {
+        "all": [0,1,2,3,4,5,6,7],
+        "prime": [7],
+        "performance": [3,4,5,6],
+        "efficiency": [0,1,2]
+      },
+      "affinity": {
+        "auto":  { "bg": "", "fg": "", "idle": "", "touch": "", "boost": "" },
+        "norm":  { "bg": "", "fg": "all", "idle": "all", "touch": "all", "boost": "all" },
+        "bg":    { "bg": "", "fg": "efficiency", "idle": "efficiency", "touch": "efficiency", "boost": "efficiency" },
+        "ui":    { "bg": "", "fg": "all", "idle": "all", "touch": "performance", "boost": "all" },
+        "crit":  { "bg": "", "fg": "all", "idle": "all", "touch": "prime", "boost": "prime" },
+        "gtcoop":{ "bg": "", "fg": "all", "idle": "all", "touch": "performance", "boost": "all" },
+        "gtmain":{ "bg": "", "fg": "all", "idle": "all", "touch": "prime", "boost": "prime" }
+      },
+      "prio": {
+        "auto":  { "bg": 0, "fg": 0, "idle": 0, "touch": 0, "boost": 0 },
+        "bg":    { "bg": -3, "fg": 139, "idle": 139, "touch": 139, "boost": 139 },
+        "norm":  { "bg": -1, "fg": -1, "idle": 120, "touch": 120, "boost": 130 },
+        "coop":  { "bg": -3, "fg": 124, "idle": 122, "touch": 122, "boost": 130 },
+        "ui":    { "bg": -3, "fg": 115, "idle": 110, "touch": 105, "boost": 105 },
+        "rtusr": { "bg": 98, "fg": 98, "idle": 97, "touch": 97, "boost": 98 }
+      },
+      "rules": [
+        {
+          "name": "Display server / WM",
+          "regex": "gnome-shell|kwin_wayland|sway|weston|Xwayland|Xorg",
+          "pinned": true,
+          "cgroup": "system",
+          "rules": [
+            {"k": "/MAIN_THREAD/", "ac": "ui", "pc": "ui"},
+            {"k": "^(RenderThread|Compositor|mutter|Meta|KMS|Wayland|Xwayland)", "ac": "crit", "pc": "ui"},
+            {"k": ".*", "ac": "norm", "pc": "auto"}
+          ]
+        },
+        {
+          "name": "Detected game",
+          "regex": ".*",
+          "game": true,
+          "pinned": false,
+          "cgroup": "game",
+          "rules": [
+            {"k": "/MAIN_THREAD/", "ac": "gtmain", "pc": "ui"},
+            {"k": "^(UnityMain|GameThread|RenderThread|GLThread|GLESThread|RHIThread)", "ac": "gtmain", "pc": "ui"},
+            {"k": "^(Worker|TaskGraph|Job|ThreadPool|Async|IOThread)", "ac": "gtcoop", "pc": "coop"},
+            {"k": "^(Jit|HeapTask|Finalizer|ReferenceQueue|GC|pool-|Download)", "ac": "bg", "pc": "bg"},
+            {"k": ".*", "ac": "norm", "pc": "norm"}
+          ]
+        },
+        {
+          "name": "Active browser",
+          "regex": "chromium|chrome|firefox|WebKit|electron|code",
+          "pinned": false,
+          "cgroup": "system",
+          "rules": [
+            {"k": "/MAIN_THREAD/", "ac": "ui", "pc": "ui"},
+            {"k": "^(CrRendererMain|Compositor|Viz|gpu-compute|gpu-sandbox)", "ac": "ui", "pc": "ui"},
+            {"k": ".*", "ac": "norm", "pc": "norm"}
+          ]
+        }
+      ]
+    },
+
+    "cgroup": {
+      "enable": true,
+      "backend": "systemd",
+      "classes": {
+        "game": {
+          "cpumask": "all",
+          "cpuWeight": 200,
+          "uclampMin": 128,
+          "uclampMax": 1024
+        },
+        "system": {
+          "cpumask": "all",
+          "cpuWeight": 150,
+          "uclampMin": 64,
+          "uclampMax": 1024
+        },
+        "background": {
+          "cpumask": "efficiency",
+          "cpuWeight": 25,
+          "uclampMin": 0,
+          "uclampMax": 512
+        }
+      }
+    }
+  },
+
+  "initials": {
+    "cpu": {
+      "baseSampleTime": 0.01,
+      "baseSlackTime": 0.01,
+      "latencyTime": 0.2,
+      "slowLimitPower": 3.0,
+      "fastLimitPower": 6.0,
+      "fastLimitCapacity": 10.0,
+      "fastLimitRecoverScale": 0.3,
+      "predictThd": 0.3,
+      "margin": 0.25,
+      "burst": 0.0,
+      "guideCap": false,
+      "limitEfficiency": false
+    }
+  },
+
+  "presets": {
+    "balance": {
+      "*": {
+        "cpu.latencyTime": 0.2,
+        "cpu.slowLimitPower": 2.0,
+        "cpu.fastLimitPower": 2.0,
+        "cpu.fastLimitCapacity": 16.0,
+        "cpu.margin": 0.2
+      },
+      "idle": {
+        "cpu.baseSampleTime": 0.04,
+        "cpu.baseSlackTime": 0.08,
+        "cpu.predictThd": 0.3,
+        "cpu.limitEfficiency": true
+      },
+      "touch": {
+        "cpu.baseSampleTime": 0.04
+      },
+      "trigger": {
+        "cpu.latencyTime": 0.0,
+        "cpu.margin": 0.4
+      },
+      "gesture": {
+        "cpu.margin": 0.6
+      },
+      "junk": {
+        "cpu.burst": 0.6
+      },
+      "switch": {
+        "cpu.latencyTime": 0.0,
+        "cpu.slowLimitPower": 3.0,
+        "cpu.fastLimitPower": 5.0,
+        "cpu.fastLimitRecoverScale": 0.1,
+        "cpu.margin": 0.4
+      }
+    },
+
+    "powersave": {
+      "*": {
+        "cpu.latencyTime": 0.4,
+        "cpu.slowLimitPower": 1.0,
+        "cpu.fastLimitPower": 1.0,
+        "cpu.fastLimitCapacity": 4.0,
+        "cpu.margin": 0.1
+      },
+      "idle": {
+        "cpu.baseSampleTime": 0.04,
+        "cpu.baseSlackTime": 0.08,
+        "cpu.predictThd": 1.0,
+        "cpu.limitEfficiency": true
+      },
+      "touch": {
+        "cpu.baseSampleTime": 0.04
+      },
+      "switch": {
+        "cpu.latencyTime": 0.0,
+        "cpu.slowLimitPower": 1.5,
+        "cpu.fastLimitPower": 2.5,
+        "cpu.fastLimitRecoverScale": 0.1,
+        "cpu.margin": 0.3
+      }
+    },
+
+    "performance": {
+      "*": {
+        "cpu.latencyTime": 0.0,
+        "cpu.slowLimitPower": 999.0,
+        "cpu.fastLimitPower": 999.0,
+        "cpu.fastLimitCapacity": 999.0,
+        "cpu.margin": 0.4,
+        "cpu.burst": 0.2
+      },
+      "idle": {
+      },
+      "touch": {
+        "cpu.margin": 0.4,
+        "cpu.latencyTime": 0.0
+      },
+      "switch": {
+        "cpu.burst": 0.2
+      }
+    }
+  }
+}

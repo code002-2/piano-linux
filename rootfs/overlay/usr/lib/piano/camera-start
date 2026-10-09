@@ -1,0 +1,68 @@
+#!/bin/sh
+# camera-start: camera bring-up (piano-camera service).
+#
+# Runs after piano-display, which loads the apps SMMU driver CAMSS is
+# attached to and the GENI I2C driver of the front sensor bus, and after
+# piano-touch, which loads the GPI DMA controllers. Nothing autoloads the
+# camera drivers (of: modaliases are skipped by 80-drivers.rules).
+#
+# piano-camerad (started early, independently) runs the sensors through the
+# TFE hardware ISP and feeds the v4l2loopback cameras applications use.
+# Like Iris, CAMSS needs a translated DMA domain under iommu.passthrough=1,
+# so its IOMMU group (the IFE stream alone) is switched to DMA before the
+# driver binds.
+#
+# Raw-frame tools (libcamera) allocate their buffers from a DMA heap and
+# take linux,cma first when it exists; the default CMA area is far too
+# small for full-resolution frames, so only the system heap is loaded
+# (cma_heap is blacklisted).
+# /etc/piano/camera.conf may set CAMERA_START=0 to skip everything.
+set -eu
+
+CAMERA_START=1
+# shellcheck source=/dev/null
+[ ! -r /etc/piano/camera.conf ] || . /etc/piano/camera.conf
+
+CAMSS=/sys/bus/platform/devices/ad27000.isp-ml
+FRONT_BUS=/sys/bus/platform/devices/884000.i2c
+
+say() {
+    echo "piano-camera: $*"
+    echo "piano-camera: $*" > /dev/kmsg 2>/dev/null || true
+}
+
+die() {
+    say "FAIL: $*"
+    exit 1
+}
+
+wait_bound() {
+    n=0
+    until [ -e "$1/driver" ]; do
+        [ "$n" -lt 100 ] || die "$2 not bound"
+        sleep 0.1; n=$((n + 1))
+    done
+}
+
+[ "$CAMERA_START" = 1 ] || { say "disabled by /etc/piano/camera.conf"; exit 0; }
+
+[ -e "$CAMSS/iommu_group" ] || die 'CAMSS has no IOMMU group (apps SMMU not bound?)'
+echo DMA > "$CAMSS/iommu_group/type" || die 'cannot switch the CAMSS IOMMU group to DMA'
+
+modprobe system_heap
+modprobe cambistmclkcc_sm8750
+modprobe camcc_sm8750
+# rear sensor and its focus actuator on CCI0, front sensor on QUP2 SE1
+modprobe i2c_qcom_cci
+wait_bound "$FRONT_BUS" 'front sensor I2C bus'
+modprobe dw9768
+modprobe s5kjn1
+modprobe ov32d40
+modprobe qcom_camss
+
+wait_bound "$CAMSS" 'CAMSS'
+sensors=""
+for dev in /sys/bus/i2c/devices/*-0010; do
+    [ -e "$dev/driver" ] && sensors="$sensors $(cat "$dev/name")"
+done
+say "DONE sensors:${sensors:- none}"

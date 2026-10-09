@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* CPU frequency profile: DVFS through the CPUCP firmware.
+ *
+ * Both CPU clusters are scaled by the CPUCP over SCMI (perf protocol 0x13;
+ * cpu0-5 are domain 0, cpu6-7 domain 1).  The stock base already describes
+ * all of it: the SCMI node, its shared memory and the CPU "clocks" links to
+ * the perf protocol, which mainline scmi-cpufreq accepts.  Only the
+ * mailbox carries a downstream compatible (qcom,cpucp-v2), so nothing
+ * binds it, SCMI defers forever and the cores stay at the bootloader's
+ * clocks (about 2.0 GHz and 1.0 GHz).
+ *
+ *   - The register layout is the one of upstream sm8750.dtsi (rx block at
+ *     0x16430000, tx at 0x17830000); the stock ranges cover every register
+ *     the mainline driver touches.
+ *   - SCMI uses channels 0 and 2.  The stock cpufreq-thermal (5, 6),
+ *     cpucp_fast (7) and cpucp_log (1) clients have no mainline driver.
+ *   - Thermal limits stay with the stock CPU thermal zones (passive trips
+ *     bound to the cpufreq cooling devices) and the CPUCP's own limits.
+ *
+ * Nothing loads the mailbox driver on coldplug (of: modaliases are not
+ * autoloaded); modules-load.d does.
+ */
+#include "dtbo-piano-keyboard.dts"
+
+/ {
+	fragment@330 {
+		target = <&cpucp>;
+		__overlay__ {
+			compatible = "qcom,sm8750-cpucp-mbox", "qcom,x1e80100-cpucp-mbox";
+		};
+	};
+};

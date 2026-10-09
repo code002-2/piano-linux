@@ -1,0 +1,355 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* Audio profile: the AudioReach chain on the ADSP with the digital
+ * microphones (VA macro, codec-DMA capture).
+ *
+ * Register layout, clocks and bindings follow upstream sm8750.dtsi,
+ * converted to the 1-cell /soc bus of the stock base; every node is added
+ * next to the stock downstream audio nodes, which stay driverless.  The
+ * stock gpr node keeps its downstream children (spf_core, q6prm,
+ * audio-pkt: no driver) and gains the mainline domain id and services.
+ *
+ * Speakers: four FourSemi FS19xx amplifiers on I2C hub SE0, fed by the
+ * secondary LPAIF TDM interface (stock resourcemanager:
+ * TDM-LPAIF-RX-SECONDARY), 4 x 32-bit slots at 48 kHz, the SoC providing
+ * the clocks.  Slots, boost and EQ come from the vendor preset file.
+ *
+ * Not here (yet): the WCD9395 headset codec.
+ *
+ * The microphone bias supply is a fixed stand-in: nothing here writes an
+ * RPMh rail.
+ */
+#include "dtbo-piano-subsys.dts"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/sound/qcom,q6dsp-lpass-ports.h>
+#include <dt-bindings/soc/qcom,gpr.h>
+
+/ {
+	/*
+	 * The SM8750 ADSP firmware only answers the static GPR source ports of
+	 * the downstream service ids: the APM client is 3 (stock spf_core) and
+	 * the PRM client 7 (stock q6prm); mainline's 1 and 2 are dropped
+	 * silently.  Move the stock driverless children out of the way and
+	 * take their ids.  (q6apm follows its reg as source port, see
+	 * audioreach_set_apm_src_port().)
+	 */
+	fragment@300 {
+		target-path = "/soc/remoteproc-adsp@03000000/glink-edge/qcom,gpr";
+		__overlay__ {
+			qcom,domain = <GPR_DOMAIN_ID_ADSP>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			spf_core {
+				reg = <0x30>;
+			};
+
+			q6prm {
+				reg = <0x37>;
+			};
+
+			q6apm_ml: service@3 {
+				compatible = "qcom,q6apm";
+				reg = <3>;
+				#sound-dai-cells = <0>;
+				qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
+
+				q6apmbedai_ml: bedais {
+					compatible = "qcom,q6apm-lpass-dais";
+					#sound-dai-cells = <1>;
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					dai@28 {
+						reg = <SECONDARY_TDM_RX_0>;
+						clocks = <&q6prmcc_ml LPASS_CLK_ID_SEC_TDM_IBIT
+								      LPASS_CLK_ATTRIBUTE_COUPLE_NO>;
+						clock-names = "bclk";
+					};
+				};
+
+				/*
+				 * The ADSP takes the stream id of its accesses to
+				 * PCM buffers from address bits 32+, which
+				 * q6apm-dai fills from the first iommus entry.
+				 * Without it the ADSP uses 0x1000, a stream with
+				 * no match, and the first capture resets the SoC.
+				 * The stock SMMU node has no driver, so the
+				 * buffers stay untranslated like fastrpc's, on
+				 * the 0x1001/0x80 and 0x1041/0x20 bypass matches
+				 * that rootfs-init writes.
+				 */
+				q6apmdai_ml: dais {
+					compatible = "qcom,q6apm-dais";
+					iommus = <&apps_smmu 0x1001 0x80>,
+						 <&apps_smmu 0x1041 0x20>;
+				};
+			};
+
+			q6prm_ml: service@7 {
+				compatible = "qcom,q6prm";
+				reg = <7>;
+				qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
+
+				q6prmcc_ml: clock-controller {
+					compatible = "qcom,q6prm-lpass-clocks";
+					#clock-cells = <2>;
+				};
+			};
+		};
+	};
+
+	fragment@301 {
+		target-path = "/soc";
+		__overlay__ {
+			audio_micb_ml: audio-micb-ml {
+				compatible = "regulator-fixed";
+				regulator-name = "audio-micb-stand-in";
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+				regulator-always-on;
+				regulator-boot-on;
+			};
+
+			lpass_vamacro_ml: codec@7660000 {
+				compatible = "qcom,sm8750-lpass-va-macro", "qcom,sm8550-lpass-va-macro";
+				reg = <0x07660000 0x2000>;
+				clocks = <&q6prmcc_ml LPASS_CLK_ID_TX_CORE_MCLK LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
+					 <&q6prmcc_ml LPASS_HW_MACRO_VOTE LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
+					 <&q6prmcc_ml LPASS_HW_DCODEC_VOTE LPASS_CLK_ATTRIBUTE_COUPLE_NO>;
+				clock-names = "mclk", "macro", "dcodec";
+				#clock-cells = <0>;
+				clock-output-names = "fsgen";
+				#sound-dai-cells = <1>;
+				vdd-micb-supply = <&audio_micb_ml>;
+				qcom,dmic-sample-rate = <4800000>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&dmic01_default_ml>, <&dmic23_default_ml>;
+			};
+
+			sound_ml: sound-ml {
+				compatible = "xiaomi,piano-sndcard", "qcom,sm8750-sndcard",
+					     "qcom,sm8450-sndcard";
+				model = "Xiaomi Pad 8 Pro";
+				pinctrl-names = "default";
+				pinctrl-0 = <&tdm1_default_ml>;
+
+				speaker-dai-link {
+					link-name = "Speaker Playback";
+
+					codec {
+						sound-dai = <&spk_top_left_ml>, <&spk_top_right_ml>,
+							    <&spk_bottom_left_ml>, <&spk_bottom_right_ml>;
+						dai-tdm-slot-num = <4>;
+						dai-tdm-slot-width = <32>;
+					};
+
+					cpu {
+						sound-dai = <&q6apmbedai_ml SECONDARY_TDM_RX_0>;
+						dai-tdm-slot-num = <4>;
+						dai-tdm-slot-width = <32>;
+						dai-tdm-slot-rx-mask = <1 1 1 1>;
+					};
+
+					platform {
+						sound-dai = <&q6apm_ml>;
+					};
+				};
+
+				va-dai-link {
+					link-name = "VA Capture";
+
+					codec {
+						sound-dai = <&lpass_vamacro_ml 0>;
+					};
+
+					cpu {
+						sound-dai = <&q6apmbedai_ml VA_CODEC_DMA_TX_0>;
+					};
+
+					platform {
+						sound-dai = <&q6apm_ml>;
+					};
+				};
+			};
+
+			lpass_tlmm_ml: pinctrl@7760000 {
+				compatible = "qcom,sm8750-lpass-lpi-pinctrl",
+					     "qcom,sm8650-lpass-lpi-pinctrl";
+				reg = <0x07760000 0x20000>;
+				clocks = <&q6prmcc_ml LPASS_HW_MACRO_VOTE LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
+					 <&q6prmcc_ml LPASS_HW_DCODEC_VOTE LPASS_CLK_ATTRIBUTE_COUPLE_NO>;
+				clock-names = "core", "audio";
+				gpio-controller;
+				#gpio-cells = <2>;
+				gpio-ranges = <&lpass_tlmm_ml 0 0 23>;
+
+				dmic01_default_ml: dmic01-default-state {
+					clk-pins {
+						pins = "gpio6";
+						function = "dmic1_clk";
+						drive-strength = <8>;
+						output-high;
+					};
+
+					data-pins {
+						pins = "gpio7";
+						function = "dmic1_data";
+						drive-strength = <8>;
+						input-enable;
+					};
+				};
+
+				dmic23_default_ml: dmic23-default-state {
+					clk-pins {
+						pins = "gpio8";
+						function = "dmic2_clk";
+						drive-strength = <8>;
+						output-high;
+					};
+
+					data-pins {
+						pins = "gpio9";
+						function = "dmic2_data";
+						drive-strength = <8>;
+						input-enable;
+					};
+				};
+			};
+		};
+	};
+
+	/*
+	 * Pin states on the mainline TLMM node, merged by path (the bootloader
+	 * skips fragments that target a node created by an overlay).
+	 */
+	fragment@302 {
+		target-path = "/soc";
+		__overlay__ {
+			pinctrl@f100000 {
+				/* stock qupv3_hub_i2c0_*_active */
+				hub_i2c0_data_clk_ml: hub-i2c0-data-clk-state {
+					pins = "gpio64", "gpio65";
+					function = "i2chub0_se0";
+					drive-strength = <2>;
+					bias-pull-up;
+				};
+
+				/* stock i2s1_*_active: TDM1 to the speaker amplifiers */
+				tdm1_default_ml: tdm1-default-state {
+					sck-pins {
+						pins = "gpio121";
+						function = "i2s1_sck";
+						drive-strength = <8>;
+						bias-disable;
+					};
+
+					data0-pins {
+						pins = "gpio122";
+						function = "i2s1_data0";
+						drive-strength = <8>;
+						bias-disable;
+					};
+
+					ws-pins {
+						pins = "gpio123";
+						function = "i2s1_ws";
+						drive-strength = <8>;
+						bias-disable;
+					};
+
+					data1-pins {
+						pins = "gpio124";
+						function = "i2s1_data1";
+						drive-strength = <8>;
+						bias-disable;
+					};
+				};
+			};
+		};
+	};
+
+	/*
+	 * Speaker amplifiers: I2C hub SE0, mainline master-hub binding on the
+	 * stock node (the hub wrapper is converted in the display overlay).
+	 * Shutdown pins as in the stock nodes; their interrupt lines are not
+	 * used.  The stock children stay, disabled, so that the addresses are
+	 * free.
+	 */
+	fragment@303 {
+		target = <&qupv3_hub_i2c0>;
+		__overlay__ {
+			compatible = "qcom,geni-i2c-master-hub";
+			clocks = <&gcc GCC_QUPV3_I2C_S0_CLK>,
+				 <&gcc GCC_QUPV3_I2C_CORE_CLK>;
+			clock-names = "se", "core";
+			interconnects = <&clk_virt MASTER_QUP_CORE_0 QCOM_ICC_TAG_ALWAYS
+					 &clk_virt SLAVE_QUP_CORE_0 QCOM_ICC_TAG_ALWAYS>,
+					<&gem_noc MASTER_APPSS_PROC QCOM_ICC_TAG_ALWAYS
+					 &config_noc SLAVE_I2C QCOM_ICC_TAG_ALWAYS>;
+			interconnect-names = "qup-core", "qup-config";
+			pinctrl-names = "default";
+			pinctrl-0 = <&hub_i2c0_data_clk_ml>;
+			/* The stock "sleep" state is in the driverless stock TLMM. */
+			pinctrl-1 = <&hub_i2c0_data_clk_ml>;
+			clock-frequency = <400000>;
+			status = "okay";
+
+			fs19xx_smartpa@34 {
+				status = "disabled";
+			};
+
+			fs19xx_smartpa@35 {
+				status = "disabled";
+			};
+
+			fs19xx_smartpa@36 {
+				status = "disabled";
+			};
+
+			fs19xx_smartpa@37 {
+				status = "disabled";
+			};
+
+			/*
+			 * Speaker positions in the landscape orientation with the
+			 * front camera at the top (checked by ear); the vendor tree
+			 * names them for portrait.
+			 */
+			spk_bottom_left_ml: audio-codec@34 {
+				compatible = "foursemi,fs19xx";
+				reg = <0x34>;
+				#sound-dai-cells = <0>;
+				reset-gpios = <&piano_tlmm_ml 128 GPIO_ACTIVE_LOW>;
+				firmware-name = "qcom/sm8750/xiaomi/piano/fs19xx.fsm";
+				sound-name-prefix = "Bottom Left";
+			};
+
+			spk_top_left_ml: audio-codec@35 {
+				compatible = "foursemi,fs19xx";
+				reg = <0x35>;
+				#sound-dai-cells = <0>;
+				reset-gpios = <&piano_tlmm_ml 129 GPIO_ACTIVE_LOW>;
+				firmware-name = "qcom/sm8750/xiaomi/piano/fs19xx.fsm";
+				sound-name-prefix = "Top Left";
+			};
+
+			spk_bottom_right_ml: audio-codec@36 {
+				compatible = "foursemi,fs19xx";
+				reg = <0x36>;
+				#sound-dai-cells = <0>;
+				reset-gpios = <&piano_tlmm_ml 107 GPIO_ACTIVE_LOW>;
+				firmware-name = "qcom/sm8750/xiaomi/piano/fs19xx.fsm";
+				sound-name-prefix = "Bottom Right";
+			};
+
+			spk_top_right_ml: audio-codec@37 {
+				compatible = "foursemi,fs19xx";
+				reg = <0x37>;
+				#sound-dai-cells = <0>;
+				reset-gpios = <&piano_tlmm_ml 108 GPIO_ACTIVE_LOW>;
+				firmware-name = "qcom/sm8750/xiaomi/piano/fs19xx.fsm";
+				sound-name-prefix = "Top Right";
+			};
+		};
+	};
+};

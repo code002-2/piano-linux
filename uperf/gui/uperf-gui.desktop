@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=uperf-gui
+GenericName=Performance Scheduler Controller
+Comment=Graphical controller for uperf-linux system scheduler
+Exec=uperf-gui
+Icon=uperf
+Terminal=false
+Type=Application
+Categories=System;
+Keywords=performance;scheduler;cpu;gaming;
+StartupNotify=false

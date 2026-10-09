@@ -1,0 +1,12 @@
+[Unit]
+Description=Piano pstore archive (silent-reset evidence)
+Documentation=file:/usr/lib/piano/pstore-save
+After=local-fs.target
+ConditionPathIsDirectory=/sys/fs/pstore
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/piano/pstore-save
+
+[Install]
+WantedBy=multi-user.target

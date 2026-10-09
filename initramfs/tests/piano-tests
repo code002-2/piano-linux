@@ -1,0 +1,182 @@
+#!/bin/sh
+# piano-tests — menu orchestrator for the piano first-light test image.
+#
+# Usage: piano-tests            interactive menu
+#        piano-tests --auto     one-shot boot smoke report (used by /init)
+
+MODE=menu
+[ "${1-}" = "--auto" ] && MODE=auto
+
+# --- one-line subsystem status with OK/FAIL markers -------------------------
+mark_ok="[ OK ]"
+mark_no="[FAIL]"
+mark_sk="[    ]"
+
+# subsystem summary: name, evidence string, 1=ok 0=fail 2=skip
+S_TOUCH=2; S_DISP=2; S_BT=2; S_WLAN=2; S_BAT=2; S_AUDIO=2; S_NET=2; S_ADSP=2
+E_TOUCH=""; E_DISP=""; E_BT=""; E_WLAN=""; E_BAT=""; E_AUDIO=""; E_NET=""; E_ADSP=""
+
+probe_all() {
+    # ADSP remoteproc
+    for r in /sys/class/remoteproc/remoteproc*; do
+        [ -d "$r" ] || continue
+        case "$(cat "$r/name" 2>/dev/null)" in
+            *adsp*)
+                st=$(cat "$r/state" 2>/dev/null)
+                E_ADSP=$st
+                [ "$st" = "running" ] && S_ADSP=1 || S_ADSP=0
+                ;;
+        esac
+    done
+    [ -n "$E_ADSP" ] || { S_ADSP=0; E_ADSP="no node"; }
+
+    # touch
+    if [ -e /proc/nvt_thp_status ]; then
+        S_TOUCH=1
+        E_TOUCH="fw $(sed -n 's/^fw_ver: //p' /proc/nvt_thp_status), $(sed -n 's/^frames: //p' /proc/nvt_thp_status) frames"
+    else
+        S_TOUCH=2; E_TOUCH="not loaded (menu 1)"
+    fi
+
+    # display
+    if [ -e /dev/fb0 ]; then
+        S_DISP=1; E_DISP="fb0 $(cat /sys/class/graphics/fb0/virtual_size 2>/dev/null)"
+    else
+        S_DISP=0; E_DISP="no fb0"
+    fi
+
+    # battery (battmgr)
+    if [ -d /sys/class/power_supply/qcom-battmgr-bat ]; then
+        cap=$(cat /sys/class/power_supply/qcom-battmgr-bat/capacity 2>/dev/null)
+        st=$(cat /sys/class/power_supply/qcom-battmgr-bat/status 2>/dev/null)
+        S_BAT=1; E_BAT="$cap% $st"
+    else
+        S_BAT=0; E_BAT="no battmgr psy (see adsp row)"
+    fi
+
+    # audio
+    if grep -q ':' /proc/asound/cards 2>/dev/null; then
+        S_AUDIO=1; E_AUDIO=$(sed -n 's/^ *\([0-9]\).*\[\(.*\)\].*/card \1 \2/p' /proc/asound/cards | head -1)
+    else
+        S_AUDIO=0; E_AUDIO="no sound card"
+    fi
+
+    # bluetooth
+    # hci0 is registered before the QCA setup runs, so its presence alone
+    # proves nothing: judge by the last hci0 kernel message
+    bt_last=$(dmesg 2>/dev/null | grep 'Bluetooth: hci0:' | tail -1)
+    if [ ! -e /sys/class/bluetooth/hci0 ]; then
+        S_BT=0; E_BT="no hci0"
+    elif echo "$bt_last" | grep -qiE 'fail|retry|timeout|error'; then
+        S_BT=0; E_BT="hci0 setup failed"
+    else
+        S_BT=1; E_BT="hci0 set up"
+    fi
+
+    # wlan
+    n_phy=$(ls /sys/class/ieee80211 2>/dev/null | wc -l)
+    pci_wlan=""
+    for d in /sys/bus/pci/devices/*; do
+        if [ -r "$d/vendor" ] && [ "$(cat "$d/vendor" 2>/dev/null)" = "0x17cb" ]; then
+            pci_wlan="$(basename "$d") $(cat "$d/device" 2>/dev/null)"
+        fi
+    done
+    if [ "$n_phy" -gt 0 ]; then
+        S_WLAN=1; E_WLAN="phy up ($pci_wlan)"
+    elif [ -n "$pci_wlan" ]; then
+        S_WLAN=0; E_WLAN="PCI $pci_wlan, no phy"
+    else
+        S_WLAN=0; E_WLAN="no PCI function"
+    fi
+
+    # USB-NCM
+    if ip link show usb0 >/dev/null 2>&1; then
+        S_NET=1; E_NET="10.42.0.2/24 up"
+    else
+        S_NET=0; E_NET="usb0 down"
+    fi
+}
+
+mark() { # mark STATE -> prints marker
+    case $1 in
+        1) printf '%s' "$mark_ok" ;;
+        0) printf '%s' "$mark_no" ;;
+        *) printf '%s' "$mark_sk" ;;
+    esac
+}
+
+status_matrix() {
+    printf -- '---- subsystem status ------------------------------------------------\n'
+    printf '%s adsp      %-46s %s\n' "$(mark $S_ADSP)"  "$E_ADSP"  "remoteproc"
+    printf '%s battery   %-46s %s\n' "$(mark $S_BAT)"   "$E_BAT"   "pmic-glink/battmgr"
+    printf '%s audio     %-46s %s\n' "$(mark $S_AUDIO)" "$E_AUDIO" "audioreach/wcd9395"
+    printf '%s display   %-46s %s\n' "$(mark $S_DISP)"  "$E_DISP"  "DSI/nt37801"
+    printf '%s touch     %-46s %s\n' "$(mark $S_TOUCH)" "$E_TOUCH" "NT36532E SPI"
+    printf '%s wlan      %-46s %s\n' "$(mark $S_WLAN)"  "$E_WLAN"  "pcie0/ath12k"
+    printf '%s bluetooth %-46s %s\n' "$(mark $S_BT)"    "$E_BT"    "uart14/hci_qca"
+    printf '%s usb-net   %-46s %s\n' "$(mark $S_NET)"   "$E_NET"   "NCM gadget"
+    printf -- '----------------------------------------------------------------------\n'
+}
+
+header() {
+    printf '\n================ piano TEST CONSOLE ================\n'
+    printf ' %s | %s | up %s\n' \
+        "$(cat /proc/device-tree/model 2>/dev/null || echo piano)" \
+        "$(uname -r)" \
+        "$(cut -d. -f1 /proc/uptime)s"
+}
+
+pause() { printf '\n[enter] '; read -r _; }
+
+if [ "$MODE" = auto ]; then
+    header
+    status_matrix
+    piano-collect
+    echo "boot smoke report saved; run 'piano-tests' for the interactive menu."
+    exit 0
+fi
+
+while :; do
+    probe_all
+    header
+    status_matrix
+    cat <<'MENU'
+
+  -- device tests ------------------------------------------------------
+   1) touch     bring-up + 30 s draw test on screen and console
+   1s) touch    same, stats only (no drawing)
+   1u) touch    keep a uinput touchscreen running until reboot
+   2) display   colour bars + noise, hold on each
+   3) audio     ADSP/soundwire/soundcard chain  (+ tone with 3a)
+   3a) audio + playback test tone
+   4) battery   ADSP/battmgr telemetry
+  -- connectivity ------------------------------------------------------
+   5) wlan      pcie0 + ath12k + optional scan
+   6) bluetooth uart14 + pwrseq + hci0
+  -- evidence ----------------------------------------------------------
+   7) collect   one-shot evidence tarball
+   7v) collect --verbose (deep dumps for remote analysis)
+   8) dmesg     subsystem-filtered tail
+   9) probe     refresh status matrix
+   q) quit
+MENU
+    printf 'choice> '
+    read -r choice || break
+    case "$choice" in
+        1) piano-touch-test --seconds 30; pause ;;
+        1s) piano-touch-test --view stats --seconds 10; pause ;;
+        1u) piano-touch-test --upto 3 && piano-touch-test --stage 5; pause ;;
+        2) piano-display-test --bars --noise --hold 2; pause ;;
+        3) piano-audio-test; pause ;;
+        3a) piano-audio-test --play; pause ;;
+        4) piano-battery-test; pause ;;
+        5) piano-wifi-test; pause ;;
+        6) piano-bt-test; pause ;;
+        7) piano-collect; pause ;;
+        7v) piano-collect --verbose; pause ;;
+        8) dmesg | grep -iE 'nv|touch|panel|dsi|mdss|drm|usb|dwc|pmic|batt|adsp|remoteproc|asoc|soundwire|wcd|wsa|q6|ath|qca|mhi' | tail -60; pause ;;
+        9) : ;;
+        q|Q) break ;;
+        *) echo "unknown choice" ;;
+    esac
+done

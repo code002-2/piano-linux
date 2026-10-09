@@ -1,0 +1,57 @@
+#!/bin/sh
+# audio-start: ordered sound card bring-up (piano-audio service).
+#
+# Runs after piano-adsp: the AudioReach services live on the ADSP. The
+# order matters: the speaker amplifiers must be bound before the card
+# looks for its codec components, and the GPR services before the card
+# looks for its platform and CPU DAIs.
+#
+#   1 amplifiers  FS19xx speaker amplifiers on I2C hub SE0 (the I2C master
+#                 driver is loaded by piano-display)
+#   2 dsp         GPR bus, then the q6apm/q6prm services and their DAIs
+#   3 card        LPASS LPI pin controller, VA macro, then the sound card
+#
+# The routing lives in the UCM profile (Qualcomm/sm8750/Xiaomi-Pad-8-Pro).
+# /etc/piano/audio.conf may set AUDIO_START=0 to skip everything.
+set -eu
+
+AUDIO_START=1
+# shellcheck source=/dev/null
+[ ! -r /etc/piano/audio.conf ] || . /etc/piano/audio.conf
+
+say() {
+    echo "piano-audio: $*"
+    echo "piano-audio: $*" > /dev/kmsg 2>/dev/null || true
+}
+
+[ "$AUDIO_START" = 1 ] || { say "disabled by /etc/piano/audio.conf"; exit 0; }
+
+adsp=''
+for d in /sys/class/remoteproc/remoteproc*; do
+    [ -r "$d/name" ] && [ "$(cat "$d/name")" = adsp ] && adsp=$d
+done
+if [ -z "$adsp" ] || [ "$(cat "$adsp/state")" != running ]; then
+    say "ADSP not running, no sound card"
+    exit 0
+fi
+
+say "BEGIN amplifiers"
+modprobe snd_soc_fs19xx || say "WARN snd_soc_fs19xx"
+
+say "BEGIN dsp"
+modprobe apr || { say "FAIL apr"; exit 0; }
+for m in snd_q6apm q6prm q6prm_clocks q6apm_lpass_dais q6apm_dai; do
+    modprobe "$m" || say "WARN $m"
+done
+
+say "BEGIN card"
+for m in pinctrl_sm8650_lpass_lpi snd_soc_lpass_va_macro snd_soc_sc8280xp; do
+    modprobe "$m" || say "WARN $m"
+done
+
+n=0
+until [ -e /dev/snd/controlC0 ]; do
+    [ "$n" -lt 30 ] || { say "FAIL no sound card"; exit 0; }
+    sleep 1; n=$((n + 1))
+done
+say "DONE $(sed -n 's/^ *0 \[[^]]*\]: //p' /proc/asound/cards)"

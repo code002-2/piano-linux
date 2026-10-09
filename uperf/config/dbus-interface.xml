@@ -1,0 +1,131 @@
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+  "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<node>
+  <interface name="org.uperflinux.Daemon">
+
+    <!-- ============================================================
+         PROPERTIES
+         ============================================================ -->
+
+    <!-- Current power mode: "balance", "powersave", "performance" -->
+    <property name="CurrentMode" type="s" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal"
+                  value="false"/>
+    </property>
+
+    <!-- Current scene state: "idle", "touch", "trigger", "gesture",
+         "junk", "switch", "boost" -->
+    <property name="CurrentScene" type="s" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal"
+                  value="false"/>
+    </property>
+
+    <!-- Per-cluster CPU frequencies in MHz. Array length equals
+         the number of clusters defined in the config. -->
+    <property name="CpuFrequencies" type="ad" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal"
+                  value="false"/>
+    </property>
+
+    <!-- Per-CPU load percentages (0-100). Array length equals
+         the number of online CPUs. -->
+    <property name="CpuLoads" type="ad" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal"
+                  value="false"/>
+    </property>
+
+    <!-- Whether heavyLoad detection is currently active -->
+    <property name="IsHeavyLoad" type="b" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal"
+                  value="false"/>
+    </property>
+
+    <!-- List of detected game processes -->
+    <property name="GameProcesses" type="a(issss)" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal"
+                  value="false"/>
+    </property>
+
+    <property name="MaxTemperature" type="i" access="read"/>
+    <property name="ThermalState" type="s" access="read"/>
+    <property name="ManualFreqOverride" type="ax" access="read"/>
+    <property name="ActiveProcess" type="i" access="read"/>
+
+    <!-- Task scheduler status: (tracked_processes, tracked_threads). -->
+    <property name="SchedulerStatus" type="(ii)" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal"
+                  value="false"/>
+    </property>
+
+    <!-- Processes currently managed by the scheduler/cgroup layer.
+         Each entry is (pid, comm, cgroup_class). -->
+    <property name="ManagedWorkloads" type="a(iss)" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal"
+                  value="false"/>
+    </property>
+
+    <!-- ============================================================
+         METHODS
+         ============================================================ -->
+
+    <!-- Change power mode. Triggers state machine reset. -->
+    <method name="SetMode">
+      <arg direction="in" type="s" name="mode"/>
+      <arg direction="out" type="b" name="success"/>
+    </method>
+
+    <!-- Reload configuration file (equivalent to SIGHUP). -->
+    <method name="ReloadConfig">
+      <arg direction="out" type="b" name="success"/>
+    </method>
+
+    <method name="SetGameMode">
+      <arg direction="in" type="i" name="pid"/>
+      <arg direction="in" type="s" name="app"/>
+      <arg direction="in" type="s" name="mode"/>
+      <arg direction="out" type="b" name="success"/>
+    </method>
+
+    <method name="SetManualFreq">
+      <arg direction="in" type="i" name="cluster"/>
+      <arg direction="in" type="x" name="freq_hz"/>
+      <arg direction="out" type="b" name="success"/>
+    </method>
+
+    <method name="SetActiveProcess">
+      <arg direction="in" type="i" name="pid"/>
+      <arg direction="out" type="b" name="success"/>
+    </method>
+
+    <!-- ============================================================
+         SIGNALS
+         ============================================================ -->
+
+    <signal name="ModeChanged">
+      <arg type="s" name="mode"/>
+    </signal>
+
+    <signal name="SceneChanged">
+      <arg type="s" name="scene"/>
+    </signal>
+
+    <signal name="StatsUpdated">
+      <arg type="ad" name="frequencies"/>
+      <arg type="ad" name="loads"/>
+    </signal>
+
+    <signal name="HeavyLoadStateChanged">
+      <arg type="b" name="active"/>
+    </signal>
+
+    <signal name="ManualFreqChanged">
+      <arg type="i" name="cluster"/>
+      <arg type="x" name="freq_hz"/>
+    </signal>
+
+    <signal name="ActiveProcessChanged">
+      <arg type="i" name="pid"/>
+    </signal>
+
+  </interface>
+</node>

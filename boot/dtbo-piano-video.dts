@@ -1,0 +1,142 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* Video profile: the Iris hardware video decoder and encoder.
+ *
+ * Register layout, clocks and bindings follow upstream sm8750.dtsi,
+ * converted to the 1-cell /soc bus of the stock base.  Both nodes are
+ * added next to the stock downstream ones (qcom,sun-videocc-v2 and
+ * qcom,sm8750-vidc-v2), which stay driverless.
+ *
+ *   - The video clock controller takes MMCX and MXC from the mainline
+ *     rpmhpd instance of the display profile, which holds every domain it
+ *     serves at its top level (see there).
+ *   - Iris uses the stock non-secure streams 0x1940 and 0x1947 through the
+ *     mainline apps SMMU node, which the display chain binds; the secure
+ *     context banks are left out.
+ *   - No interconnect paths: the multimedia NoC provider is not bound, and
+ *     the bootloader's votes that the display keeps alive carry the video
+ *     traffic as well.
+ *   - The firmware is the one signed for this device, loaded into the stock
+ *     video_mem carve-out.
+ *
+ * Nothing loads the drivers on coldplug: the piano-video service does,
+ * after the display chain.
+ */
+#include "dtbo-piano-audio.dts"
+#include <dt-bindings/clock/qcom,sm8750-gcc.h>
+#include <dt-bindings/clock/qcom,sm8750-videocc.h>
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+#include <dt-bindings/power/qcom,rpmhpd.h>
+
+/ {
+	fragment@310 {
+		target-path = "/soc";
+		__overlay__ {
+			videocc_ml: clock-controller-ml@aaf0000 {
+				compatible = "qcom,sm8750-videocc";
+				reg = <0xaaf0000 0x10000>;
+				clocks = <&bi_tcxo_div2>,
+					 <&gcc GCC_VIDEO_AHB_CLK>;
+				power-domains = <&rpmhpd_ml RPMHPD_MMCX>,
+						<&rpmhpd_ml RPMHPD_MXC>;
+				required-opps = <&rpmhpd_opp_low_svs_ml>,
+						<&rpmhpd_opp_low_svs_ml>;
+				#clock-cells = <1>;
+				#reset-cells = <1>;
+				#power-domain-cells = <1>;
+			};
+
+			iris_ml: video-codec-ml@aa00000 {
+				compatible = "qcom,sm8750-iris";
+				reg = <0xaa00000 0xf0000>;
+
+				clocks = <&gcc GCC_VIDEO_AXI0_CLK>,
+					 <&videocc_ml VIDEO_CC_MVS0C_CLK>,
+					 <&videocc_ml VIDEO_CC_MVS0_CLK>,
+					 <&gcc GCC_VIDEO_AXI1_CLK>,
+					 <&videocc_ml VIDEO_CC_MVS0C_FREERUN_CLK>,
+					 <&videocc_ml VIDEO_CC_MVS0_FREERUN_CLK>;
+				clock-names = "iface",
+					      "core",
+					      "vcodec0_core",
+					      "iface1",
+					      "core_freerun",
+					      "vcodec0_core_freerun";
+
+				dma-coherent;
+				iommus = <&apps_smmu_ml 0x1940 0x0>,
+					 <&apps_smmu_ml 0x1947 0x0>;
+
+				interrupts = <GIC_SPI 174 IRQ_TYPE_LEVEL_HIGH>;
+
+				memory-region = <&video_mem>;
+				firmware-name = "qcom/sm8750/xiaomi/piano/vpu35_4v.mbn";
+
+				operating-points-v2 = <&iris_opp_table_ml>;
+
+				power-domains = <&videocc_ml VIDEO_CC_MVS0C_GDSC>,
+						<&videocc_ml VIDEO_CC_MVS0_GDSC>,
+						<&rpmhpd_ml RPMHPD_MXC>,
+						<&rpmhpd_ml RPMHPD_MMCX>;
+				power-domain-names = "venus",
+						     "vcodec0",
+						     "mxc",
+						     "mmcx";
+
+				resets = <&gcc GCC_VIDEO_AXI0_CLK_ARES>,
+					 <&gcc GCC_VIDEO_AXI1_CLK_ARES>,
+					 <&videocc_ml VIDEO_CC_MVS0C_FREERUN_CLK_ARES>,
+					 <&videocc_ml VIDEO_CC_MVS0_FREERUN_CLK_ARES>;
+				reset-names = "bus0",
+					      "bus1",
+					      "core",
+					      "vcodec0_core";
+
+				iris_opp_table_ml: opp-table {
+					compatible = "operating-points-v2";
+
+					opp-240000000 {
+						opp-hz = /bits/ 64 <240000000>;
+						required-opps = <&rpmhpd_opp_svs_ml>,
+								<&rpmhpd_opp_low_svs_d1_ml>;
+					};
+
+					opp-338000000 {
+						opp-hz = /bits/ 64 <338000000>;
+						required-opps = <&rpmhpd_opp_svs_ml>,
+								<&rpmhpd_opp_low_svs_ml>;
+					};
+
+					opp-420000000 {
+						opp-hz = /bits/ 64 <420000000>;
+						required-opps = <&rpmhpd_opp_svs_l1_ml>,
+								<&rpmhpd_opp_svs_ml>;
+					};
+
+					opp-444000000 {
+						opp-hz = /bits/ 64 <444000000>;
+						required-opps = <&rpmhpd_opp_svs_l1_ml>,
+								<&rpmhpd_opp_svs_l1_ml>;
+					};
+
+					opp-533333334 {
+						opp-hz = /bits/ 64 <533333334>;
+						required-opps = <&rpmhpd_opp_svs_l1_ml>,
+								<&rpmhpd_opp_nom_ml>;
+					};
+
+					opp-570000000 {
+						opp-hz = /bits/ 64 <570000000>;
+						required-opps = <&rpmhpd_opp_nom_ml>,
+								<&rpmhpd_opp_nom_l1_ml>;
+					};
+
+					opp-630000000 {
+						opp-hz = /bits/ 64 <630000000>;
+						required-opps = <&rpmhpd_opp_nom_ml>,
+								<&rpmhpd_opp_turbo_ml>;
+					};
+				};
+			};
+		};
+	};
+};

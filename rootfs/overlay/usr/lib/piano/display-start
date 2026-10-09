@@ -1,0 +1,128 @@
+#!/bin/sh
+# display-start: ordered native display / GPU bring-up (msm + NT36532 panel).
+#
+# Usage: display-start [--stage N | --all]
+#
+# Every stage adds exactly one new kind of hardware access, writes a marker
+# to /dev/kmsg before touching anything and waits until its devices are
+# bound. Stages are idempotent; run them one by one while streaming
+# /dev/kmsg from the host, or --all (the piano-display service).
+#
+#   1 smmu       qcom SMMU driver: adopts every valid apps SMMU stream match
+#                (UFS, USB, display, and the ones /pianoinit added) as bypass
+#   2 gpu-clk    GPU clock controller, then the Adreno SMMU binds
+#   3 msm        msm: the GPU (GMU boot, zap shader) as its own DRM device
+#                when MSM_OPTIONS keeps separate_gpu_kms=1; the display part
+#                keeps waiting for the display clock controller
+#   4 backlight  I2C hub SE3 + QUP2 SE8 and the two KTZ8866
+#   5 display    display clock controller and panel: msm takes over from
+#                simpledrm, resets the MDSS and re-initializes the panel
+#
+# /etc/piano/display.conf may set MSM_OPTIONS (default separate_gpu_kms=1)
+# and LAST_STAGE (default 5).
+set -eu
+
+MSM_OPTIONS=separate_gpu_kms=1
+LAST_STAGE=5
+# shellcheck source=/dev/null
+[ ! -r /etc/piano/display.conf ] || . /etc/piano/display.conf
+
+say() {
+    echo "piano-display: $*"
+    echo "piano-display: $*" > /dev/kmsg 2>/dev/null || true
+}
+die() { say "FAIL $*"; exit 1; }
+
+# wait_bound DRIVER DEVICE [SECONDS]
+wait_bound() {
+    n=0
+    until [ -e "/sys/bus/platform/drivers/$1/$2" ]; do
+        [ "$n" -lt "${3:-20}" ] || return 1
+        sleep 1; n=$((n + 1))
+    done
+}
+
+wait_path() {
+    n=0
+    until [ -e "$1" ]; do
+        [ "$n" -lt "${2:-20}" ] || return 1
+        sleep 1; n=$((n + 1))
+    done
+}
+
+# probe_again DEVICE: devices that are still unbound once the deferred probe
+# timeout has passed stopped retrying (-ETIMEDOUT); probe them once more
+# now that their supplier is loaded.
+probe_again() {
+    [ -e "/sys/bus/platform/devices/$1/driver" ] ||
+        echo "$1" > /sys/bus/platform/drivers_probe 2>/dev/null || true
+}
+
+stage1() {
+    # No stream match may be added behind the SMMU driver's back once it
+    # is bound, and it must adopt the /pianoinit ones.
+    [ -f /run/piano-smmu-ready ] || die 'apps SMMU stream matches not installed'
+    modprobe arm_smmu
+    wait_bound arm-smmu 15000000.iommu || die 'apps SMMU not bound'
+}
+
+stage2() {
+    modprobe gpucc_sm8750
+    wait_bound sm8750-gpucc 3d90000.clock-controller-ml || die 'GPU clock controller not bound'
+    probe_again 3da0000.iommu
+    wait_bound arm-smmu 3da0000.iommu || die 'Adreno SMMU not bound'
+}
+
+stage3() {
+    # shellcheck disable=SC2086 # MSM_OPTIONS is a list of module options
+    modprobe msm $MSM_OPTIONS
+    wait_bound adreno 3d00000.gpu 30 || die 'GPU not bound'
+}
+
+stage4() {
+    modprobe pinctrl_sm8750
+    modprobe gpi
+    modprobe i2c_qcom_geni
+    modprobe ktz8866
+    wait_path /sys/class/backlight/ktz8866-backlight || die 'backlight not registered'
+}
+
+stage5() {
+    modprobe dispcc_sm8750
+    modprobe panel_novatek_nt36532
+    probe_again ae00000.display-subsystem
+    wait_bound msm_dpu ae01000.display-controller 30 || die 'DPU not bound'
+    # The first DSI PLL lock attempt after a cold dispcc enable can fail
+    # for a while: the kit device log (out/display-kit/logs/kmsg-stage5.log)
+    # shows five "DSI PLL(0) lock failed" lines, a 30 s timeout FAIL, and
+    # the output enabled by itself ~80 s in - before the manual re-run.
+    # Wait past the transient instead of declaring failure at 30 s.
+    n=0
+    until grep -qx enabled /sys/class/drm/card*-DSI-1/enabled 2>/dev/null; do
+        [ "$n" -lt 150 ] || die 'DSI output never enabled'
+        sleep 1; n=$((n + 1))
+    done
+}
+
+run() {
+    case "$1" in
+        1) name=smmu ;; 2) name=gpu-clk ;; 3) name=msm ;;
+        4) name=backlight ;; 5) name=display ;;
+        *) echo "unknown stage $1" >&2; exit 2 ;;
+    esac
+    say "stage $1 $name: begin"
+    "stage$1"
+    say "stage $1 $name: done"
+}
+
+case "${1-}" in
+    --stage) run "${2:?stage number}" ;;
+    --all)
+        if [ -e /etc/piano/native-display-off ]; then
+            say 'disabled: /etc/piano/native-display-off present; native display stays off'
+            exit 0
+        fi
+        i=1
+        while [ "$i" -le "$LAST_STAGE" ]; do run "$i"; i=$((i + 1)); done ;;
+    *) sed -n '2,24p' "$0"; exit 2 ;;
+esac

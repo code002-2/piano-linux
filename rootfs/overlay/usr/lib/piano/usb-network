@@ -1,0 +1,33 @@
+#!/bin/sh
+# Shared by the installed system and the initramfs rescue environment.
+set -eu
+mkdir -p /sys/kernel/config
+if ! grep -q ' /sys/kernel/config ' /proc/mounts; then
+    mount -t configfs configfs /sys/kernel/config
+fi
+n=0; udc=
+while [ "$n" -lt 120 ]; do
+    for u in /sys/class/udc/*; do [ ! -e "$u" ] || { udc=${u##*/}; break; }; done
+    [ -z "$udc" ] || break
+    sleep 1; n=$((n + 1))
+done
+[ -n "$udc" ] || { echo 'No USB device controller after 120 seconds'; exit 1; }
+g=/sys/kernel/config/usb_gadget/piano
+mkdir -p "$g"
+if [ ! -s "$g/UDC" ] || [ -z "$(cat "$g/UDC")" ]; then
+    echo 0x18d1 > "$g/idVendor"
+    echo 0xd001 > "$g/idProduct"
+    echo 0x0200 > "$g/bcdUSB"
+    mkdir -p "$g/strings/0x409" "$g/functions/ncm.usb0" "$g/configs/b.1/strings/0x409"
+    echo piano-linux > "$g/strings/0x409/manufacturer"
+    echo 'Piano Debian USB' > "$g/strings/0x409/product"
+    echo 0123456789 > "$g/strings/0x409/serialnumber"
+    echo 02:11:22:33:44:55 > "$g/functions/ncm.usb0/dev_addr"
+    echo 02:66:77:88:99:aa > "$g/functions/ncm.usb0/host_addr"
+    echo ncm > "$g/configs/b.1/strings/0x409/configuration"
+    echo 500 > "$g/configs/b.1/MaxPower"
+    [ -e "$g/configs/b.1/ncm.usb0" ] || ln -s "$g/functions/ncm.usb0" "$g/configs/b.1/ncm.usb0"
+    echo "$udc" > "$g/UDC"
+fi
+ip link set usb0 up
+ip addr replace 10.42.0.2/24 dev usb0

@@ -1,0 +1,11 @@
+[Unit]
+Description=Piano USB NCM management network
+After=systemd-remount-fs.service
+Before=ssh.service
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/piano/usb-network
+RemainAfterExit=yes
+TimeoutStartSec=130
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,22 @@
+#!/bin/sh
+# Archive the previous boot's pstore records (ramoops @ 0xa3500000) to
+# persistent storage.  fastboot mode wipes the ramoops region, and the
+# only way back into the system after a silent reset is a fastboot RAM
+# boot — which would destroy the evidence.  The signed boot_b image
+# boots this same rootfs after every reset, so archiving here on every
+# boot keeps the forensic trail alive across the fastboot round-trip.
+set -u
+DEST=/var/lib/piano/pstore
+mkdir -p "$DEST"
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+found=0
+for f in /sys/fs/pstore/*; do
+    [ -f "$f" ] || continue
+    found=$((found + 1))
+    cp "$f" "$DEST/${stamp}-$(basename "$f")"
+done
+if [ "$found" -gt 0 ]; then
+    uname -a > "$DEST/${stamp}-uname.txt"
+    echo "pstore-save: archived $found record(s) to $DEST"
+fi
+exit 0

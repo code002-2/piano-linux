@@ -1,0 +1,90 @@
+#!/bin/sh
+# adsp-start: ordered ADSP bring-up (piano-adsp service).
+#
+# Runs after the native display is up: with the display driver owning the
+# panel rails the ADSP firmware no longer takes the panel down, which it did
+# when only the bootloader-configured framebuffer was alive.
+#
+#   1 remoteproc  qcom_q6v5_pas binds the stock adsp node (auto boot is off in
+#                 the device tree), then the QRTR and PD-mapper helpers
+#   2 start       boot the ADSP firmware through sysfs and wait for "running"
+#   3 power       pmic_glink and the Xiaomi MCA property transport (piano_mca)
+#                 with charge_policy: the USB input current limit follows the
+#                 charger type (up to 1.5 A at 5 V) instead of the ADSP's
+#                 ~0.4 A power-on hold, which is below the system draw;
+#                 hv_charge: PD sources are asked for 9 V (a fixed 9 V PDO,
+#                 else a PPS APDO), with up to 2.5 A input there;
+#                 charge_current: the battery charge current follows the
+#                 charger type (up to 3 A at 15-38 degC) instead of the
+#                 ADSP's ~0.5 A fallback; pan_ack: the ADSP's USB-C port
+#                 notifications are acknowledged, without which its PD state
+#                 machine waits 13 s per notification and a source attached
+#                 at boot gets its PD contract only after 70-80 s;
+#                 mipps_auth: the Xiaomi charger authentication messages
+#                 are relayed for xiaomi-mipps-auth; cp_charge: PPS
+#                 sources (a verified Xiaomi adapter up to 5 A on the bus,
+#                 others 4.1 A) charge through the SC8541 2:1 stage
+#                 (sc8541_charger) with the buck charger in parallel
+#
+# /etc/piano/adsp.conf may set ADSP_START=0 to skip everything,
+# CHARGE_POLICY=0 to leave charging to the ADSP, or CHARGE_HV=0 /
+# CHARGE_CURRENT=0 to keep 5 V / the ADSP's charge current, CHARGE_PAN=0
+# to leave the port notifications unacknowledged, CHARGE_MIPPS=0 to skip
+# the Xiaomi charger authentication, or CHARGE_CP=0 to stay on the buck
+# charger (22.5 W at most).  CHARGE_CP needs CHARGE_HV and CHARGE_CURRENT.
+set -eu
+
+ADSP_START=1
+CHARGE_POLICY=1
+CHARGE_HV=1
+CHARGE_CURRENT=1
+CHARGE_PAN=1
+CHARGE_MIPPS=1
+CHARGE_CP=1
+# shellcheck source=/dev/null
+[ ! -r /etc/piano/adsp.conf ] || . /etc/piano/adsp.conf
+
+say() {
+    echo "piano-adsp: $*"
+    echo "piano-adsp: $*" > /dev/kmsg 2>/dev/null || true
+}
+
+[ "$ADSP_START" = 1 ] || { say "disabled by /etc/piano/adsp.conf"; exit 0; }
+
+say "BEGIN remoteproc"
+modprobe qcom_q6v5_pas || { say "FAIL qcom_q6v5_pas"; exit 0; }
+modprobe qrtr_smd || say "WARN qrtr_smd"
+modprobe qcom_pd_mapper || say "WARN qcom_pd_mapper"
+
+rp=''
+n=0
+while [ -z "$rp" ] && [ "$n" -lt 20 ]; do
+    for d in /sys/class/remoteproc/remoteproc*; do
+        [ -r "$d/name" ] || continue
+        [ "$(cat "$d/name")" = adsp ] && rp=$d
+    done
+    [ -n "$rp" ] || { sleep 1; n=$((n + 1)); }
+done
+[ -n "$rp" ] || { say "FAIL no adsp remoteproc"; exit 0; }
+
+say "BEGIN start"
+if [ "$(cat "$rp/state")" != running ]; then
+    echo start > "$rp/state" || { say "FAIL start"; exit 0; }
+fi
+n=0
+until [ "$(cat "$rp/state")" = running ]; do
+    [ "$n" -lt 15 ] || { say "FAIL adsp state $(cat "$rp/state")"; exit 0; }
+    sleep 1; n=$((n + 1))
+done
+say "DONE adsp running"
+
+say "BEGIN power"
+modprobe pmic_glink || say "WARN pmic_glink"
+if [ "$CHARGE_CP" = 1 ] && ! modprobe sc8541_charger; then
+    say "WARN sc8541_charger"
+    CHARGE_CP=0
+fi
+modprobe piano_mca charge_policy="$CHARGE_POLICY" hv_charge="$CHARGE_HV" \
+    charge_current="$CHARGE_CURRENT" pan_ack="$CHARGE_PAN" \
+    mipps_auth="$CHARGE_MIPPS" cp_charge="$CHARGE_CP" || say "WARN piano_mca"
+say "DONE"

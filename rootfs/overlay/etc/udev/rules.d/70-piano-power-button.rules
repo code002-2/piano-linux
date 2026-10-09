@@ -1,0 +1,6 @@
+# Let the active session user open the power key and the keyboard-cover
+# lid switch: the piano-power-button user service owns both (see
+# /usr/lib/piano/power-button).  The power key is grabbed; the lid switch
+# is only read, so its state stays visible to logind and GNOME.
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="pmic_pwrkey", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="hall_lid", TAG+="uaccess"

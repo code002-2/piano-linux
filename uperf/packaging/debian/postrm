@@ -1,0 +1,24 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|purge)
+        # The policy file has now been removed, so make the system bus forget
+        # the rules immediately instead of retaining them until reboot.
+        systemctl reload dbus 2>/dev/null \
+            || systemctl reload dbus-broker 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+        ;;
+
+    upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+
+    *)
+        echo "postrm called with unknown argument '$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0
