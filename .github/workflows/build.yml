@@ -165,6 +165,11 @@ jobs:
           cp out/ci-image/boot.img out/ci-image/dtbo.img \
               out/ci-image/kernel.config out/ci-image/packages.txt \
               out/ci-image/MANIFEST.txt out/ci-image/SOURCE-SHA256SUMS out/bundle/
+          # the uperf packages ride along so they can be installed on a device
+          # that is already running, without rebuilding the image.
+          if ls out/uperf-pkg/*.deb >/dev/null 2>&1; then
+            cp out/uperf-pkg/*.deb out/bundle/
+          fi
           (cd out/bundle && sha256sum ./* > SHA256SUMS)
           sudo tar --numeric-owner --xattrs --acls -C out/ci-image/rootfs \
               -I 'zstd -T0 -3' -cf out/rootfs-tar/rootfs-trixie-gnome-arm64.tar.zst .
