@@ -1,0 +1,22 @@
+#!/bin/sh
+set -eu
+F=/usr/bin/gnome-control-center
+[ -f "$F" ] || exit 0
+if python3 -c "import sys; sys.exit(0 if b'%s \xc3\x97 %d' in open('$F','rb').read() else 1)" 2>/dev/null; then
+    TMP="$F.new"
+    cp -a "$F" "$TMP"
+    python3 - "$TMP" <<'PY'
+import sys
+p = sys.argv[1]
+d = bytearray(open(p, 'rb').read())
+needle = b"%s \xc3\x97 %d"
+repl = b"%s\x00\x00\x00\x00\x00\x00"
+assert len(needle) == len(repl)
+d = d.replace(needle, repl)
+open(p, 'wb').write(bytes(d))
+PY
+    chmod 0755 "$TMP"
+    chown root:root "$TMP"
+    mv -f "$TMP" "$F"
+    echo "piano-about: removed the core-count suffix"
+fi

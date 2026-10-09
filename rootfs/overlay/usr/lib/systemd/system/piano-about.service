@@ -1,0 +1,14 @@
+[Unit]
+Description=Piano about-panel clean-up
+DefaultDependencies=no
+After=systemd-remount-fs.service sysinit.target
+Before=systemd-user-sessions.service gdm.service display-manager.service
+ConditionPathExists=/usr/bin/gnome-control-center
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/piano/patch-about
+
+[Install]
+WantedBy=multi-user.target
