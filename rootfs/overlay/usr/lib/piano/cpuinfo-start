@@ -1,0 +1,23 @@
+#!/bin/sh
+set -eu
+MODEL="Qualcomm Snapdragon 8 Elite (Oryon)"
+DTMODEL=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo 'Xiaomi Pad 8 Pro')
+GEN=/run/piano-cpuinfo
+{
+    while read -r line; do
+        case "$line" in
+            "processor"*)
+                printf '%s\n' "$line"
+                printf 'model name\t: %s\n' "$MODEL"
+                printf 'Hardware\t: %s\n' "$DTMODEL"
+                ;;
+            "Hardware"*|"model name"*) ;;
+            *) printf '%s\n' "$line" ;;
+        esac
+    done < /proc/cpuinfo
+} > "$GEN"
+chmod 0444 "$GEN"
+if ! mountpoint -q /proc/cpuinfo 2>/dev/null; then
+    mount --bind "$GEN" /proc/cpuinfo
+fi
+echo "piano-cpuinfo: $MODEL"

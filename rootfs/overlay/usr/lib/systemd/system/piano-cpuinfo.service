@@ -1,0 +1,14 @@
+[Unit]
+Description=Piano processor identification
+DefaultDependencies=no
+After=systemd-remount-fs.service
+Before=systemd-user-sessions.service gdm.service display-manager.service
+ConditionPathExists=/proc/cpuinfo
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/piano/cpuinfo-start
+
+[Install]
+WantedBy=multi-user.target
