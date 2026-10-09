@@ -133,7 +133,7 @@ jobs:
           scripts/fetch-arm64-tools.sh --output-dir out/arm64-tools
           userspace_args=()
           if ls out/uperf-pkg/*.deb >/dev/null 2>&1; then
-            userspace_args=(--userspace-dir "$PWD/out/uperf-pkg")
+            userspace_args=(--sensors-dir "$PWD/out/uperf-pkg")
           fi
           scripts/build-rootfs-image.sh \
               --firmware-tree firmware/firmware \
